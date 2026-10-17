@@ -22,6 +22,11 @@ TS_BASE="https://pkgs.tailscale.com/stable/ubuntu"
 TS_KEYRING="/usr/share/keyrings/tailscale-archive-keyring.gpg"
 TS_LIST="/etc/apt/sources.list.d/tailscale.list"
 TS_SBIN_DAEMON="/usr/sbin/tailscaled"
+# Estado y configuración previos de un Tailscale desinstalado: el postinst podría reconectar credenciales antiguas.
+TS_STATE_DIR="/var/lib/tailscale"
+TS_DEFAULTS="/etc/default/tailscaled"
+TS_UNIT="/etc/systemd/system/tailscaled.service"
+TS_DROPINS="/etc/systemd/system/tailscaled.service.d"
 CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt"
 OS_CODENAME=""
 
@@ -200,12 +205,23 @@ ts_cli_present() { have tailscale; }
 ts_daemon_present() { if have tailscaled; then return 0; fi; [ -x "$TS_SBIN_DAEMON" ]; }
 ts_complete() { ts_cli_present && ts_daemon_present; }
 
+# Rechaza estado o configuración previos de Tailscale. No lee su contenido, no lo imprime y no lo borra.
+ts_no_previous_state() {
+  local p
+  for p in "$TS_STATE_DIR" "$TS_DEFAULTS" "$TS_UNIT" "$TS_DROPINS"; do
+    if [ -e "$p" ] || [ -L "$p" ]; then
+      die "existe estado o configuración previa de Tailscale en $p: al instalar el paquete, el servicio podría arrancar y reconectar credenciales antiguas sin 'tailscale up'. No se lee ni se borra; revísalo a mano (o retíralo tú) y vuelve a ejecutar"
+    fi
+  done
+}
+
 # Solo con --apply, antes de cambiar nada.
 ts_preflight() {
   if ts_complete; then return 0; fi
   if ts_cli_present || ts_daemon_present; then
     die "instalación parcial de Tailscale (solo existe uno de tailscale/tailscaled): no se reemplaza; revísala a mano"
   fi
+  ts_no_previous_state
   need apt-get
   need sudo
   if ! selected base; then
@@ -534,6 +550,7 @@ mod_tailscale() {
   if ts_cli_present || ts_daemon_present; then
     die "instalación parcial de Tailscale (solo existe uno de tailscale/tailscaled): no se reemplaza; revísala a mano"
   fi
+  ts_no_previous_state
   case "$OS_CODENAME" in jammy|noble) ;; *) die "codename de Ubuntu no determinado o no admitido: '$OS_CODENAME'" ;; esac
   keyurl="$TS_BASE/$OS_CODENAME.noarmor.gpg"
   if [ "$APPLY" != 1 ]; then

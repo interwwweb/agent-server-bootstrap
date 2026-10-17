@@ -523,11 +523,19 @@ case "$*" in *pi-coding-agent*) printf '#!/bin/sh\\necho 0.87.1\\n' > "$FAKEBIN/
         etc = self.tmp / "etc"
         return etc / "keyrings/tailscale-archive-keyring.gpg", etc / "apt/sources.list.d/tailscale.list"
 
+    def ts_state_paths(self):
+        st = self.tmp / "st"
+        return {"state_dir": st / "lib-tailscale", "defaults": st / "default-tailscaled",
+                "unit": st / "tailscaled.service", "dropins": st / "tailscaled.service.d"}
+
     def ts_run(self, body="mod_tailscale", codename="noble", **extra):
         key, lst = self.ts_paths()
         work = self.tmp / "work"
         work.mkdir(exist_ok=True)
-        setup = (f'TS_KEYRING="{key}"; TS_LIST="{lst}"; TS_SBIN_DAEMON="{self.tmp}/no-existe/tailscaled"; '
+        st = {k: str(v) for k, v in self.ts_state_paths().items()}
+        setup = (f'TS_STATE_DIR="{st["state_dir"]}"; TS_DEFAULTS="{st["defaults"]}"; '
+                 f'TS_UNIT="{st["unit"]}"; TS_DROPINS="{st["dropins"]}"; '
+                 f'TS_KEYRING="{key}"; TS_LIST="{lst}"; TS_SBIN_DAEMON="{self.tmp}/no-existe/tailscaled"; '
                  f'CA_BUNDLE="{self.tmp}/no-existe/ca.crt"; WORK="{work}"; OS_CODENAME={codename}; SELECTED=tailscale')
         return self.sh(f'{TS_HIDE}; {setup}; {body}', FAKEBIN=str(self.bin), **extra)
 
@@ -550,6 +558,62 @@ case "$*" in *"install -y tailscale"*)
             "https://pkgs.tailscale.com/stable/ubuntu",
             "/usr/share/keyrings/tailscale-archive-keyring.gpg",
             "/etc/apt/sources.list.d/tailscale.list"])
+
+    def test_tailscale_state_constants_are_hardcoded_paths(self):
+        r = self.sh('printf "%s\\n%s\\n%s\\n%s\\n" "$TS_STATE_DIR" "$TS_DEFAULTS" "$TS_UNIT" "$TS_DROPINS"')
+        self.assertEqual(r.stdout.split(), [
+            "/var/lib/tailscale", "/etc/default/tailscaled",
+            "/etc/systemd/system/tailscaled.service", "/etc/systemd/system/tailscaled.service.d"])
+
+    def test_tailscale_previous_state_prevents_install_and_is_preserved(self):
+        self.fake_ts_env()
+        for name, path in self.ts_state_paths().items():
+            for kind in ("file", "dir", "broken-symlink"):
+                with self.subTest(path=name, kind=kind):
+                    shutil.rmtree(self.tmp / "st", ignore_errors=True)
+                    path.parent.mkdir(parents=True)
+                    if kind == "file":
+                        path.write_text("secreto-no-leer\n")
+                    elif kind == "dir":
+                        path.mkdir()
+                        (path / "x").write_text("estado\n")
+                    else:
+                        path.symlink_to(self.tmp / "no-existe")
+                    if self.log.exists():
+                        self.log.unlink()
+                    for body in ("mod_tailscale", "ts_preflight"):
+                        r = self.ts_run(body=body)
+                        self.assertEqual(r.returncode, 1)
+                        self.assertIn("estado o configuración previa", r.stderr)
+                        self.assertIn(str(path), r.stderr)
+                        self.assertNotIn("secreto", r.stdout + r.stderr)
+                        self.assertEqual(self.calls(), [])
+                        self.assertFalse((self.tmp / "etc").exists())
+                    if kind == "file":
+                        self.assertEqual(path.read_text(), "secreto-no-leer\n")
+                    elif kind == "dir":
+                        self.assertEqual((path / "x").read_text(), "estado\n")
+                    else:
+                        self.assertEqual(os.readlink(path), str(self.tmp / "no-existe"))
+
+    def test_tailscale_complete_pair_skips_even_with_previous_state(self):
+        self.fake_ts_env()
+        self.fake("tailscale", "")
+        self.fake("tailscaled", "")
+        paths = self.ts_state_paths()
+        paths["state_dir"].mkdir(parents=True)
+        (paths["state_dir"] / "x").write_text("estado\n")
+        paths["defaults"].write_text("FLAGS=1\n")
+        paths["unit"].write_text("[Unit]\n")
+        paths["dropins"].mkdir()
+        for body in ("mod_tailscale", "ts_preflight"):
+            r = self.ts_run(body=body)
+            self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual((paths["state_dir"] / "x").read_text(), "estado\n")
+        self.assertEqual(paths["defaults"].read_text(), "FLAGS=1\n")
+        self.assertEqual(paths["unit"].read_text(), "[Unit]\n")
+        self.assertFalse((self.tmp / "etc").exists())
 
     def test_tailscale_skips_existing_pair_before_any_network_or_sudo(self):
         self.fake_ts_env()
