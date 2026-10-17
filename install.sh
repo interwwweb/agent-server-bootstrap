@@ -287,7 +287,9 @@ install_node() {
   fetch "$NODE_DIST/SHASUMS256.txt" "$sums"
   line=$(awk -v a="$NODE_ARCH" -v m="$NODE_MAJOR" \
     '$2 ~ ("^node-v" m "\\.[0-9]+\\.[0-9]+-linux-" a "\\.tar\\.gz$")' "$sums")
-  [ -n "$line" ] && [ "$(printf '%s\n' "$line" | wc -l)" -eq 1 ] || die "no se encontró un único tarball de Node v$NODE_MAJOR para $NODE_ARCH en SHASUMS256.txt"
+  if [ -z "$line" ] || [ "$(printf '%s\n' "$line" | wc -l)" -ne 1 ]; then
+    die "no se encontró un único tarball de Node v$NODE_MAJOR para $NODE_ARCH en SHASUMS256.txt"
+  fi
   file=$(printf '%s\n' "$line" | awk '{print $2}')
   ver=${file#node-}; ver=${ver%-linux-*}
   dest=$NODE_ROOT/$ver
@@ -358,7 +360,7 @@ mod_cloud() {
     log "  supabase: 'supabase' ya existe, se omite"
   else
     local ws=$TOOLS/supabase
-    [ -x "$ws/node_modules/.bin/supabase" ] && [ "$APPLY" = 1 ] || npm_workspace "$ws" supabase
+    if [ ! -x "$ws/node_modules/.bin/supabase" ] || [ "$APPLY" != 1 ]; then npm_workspace "$ws" supabase; fi
     write_wrapper supabase "$ws/node_modules/.bin/supabase"
   fi
 }
@@ -374,7 +376,7 @@ mod_playwright() {
   require_node playwright
   local ws=$TOOLS/playwright pw
   pw=$ws/node_modules/.bin/playwright
-  [ -x "$pw" ] && [ "$APPLY" = 1 ] || npm_workspace "$ws" @playwright/test @playwright/cli
+  if [ ! -x "$pw" ] || [ "$APPLY" != 1 ]; then npm_workspace "$ws" @playwright/test @playwright/cli; fi
   write_wrapper playwright "$pw"
   write_wrapper playwright-cli "$ws/node_modules/.bin/playwright-cli"
   # Equivalente a «install --with-deps»: dependencias del sistema con sudo y navegador como usuario.
