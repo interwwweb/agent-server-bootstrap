@@ -121,6 +121,12 @@ pi              # solo con --with-pi: escribe /login
 - **SSH vs Mosh**: Mosh abre su sesión por SSH y luego usa UDP (por defecto 60000–61000). Este proyecto **no abre esos puertos UDP ni toca el firewall**: si usas Mosh, ábrelos tú con el criterio de tu proveedor.
 - Configurar los hooks de moshi-hook (emparejamiento con la app) es manual.
 
+## Navegador para los agentes
+
+El módulo `playwright` instala **Chromium administrado por Playwright**. No instala Google Chrome ni Brave. Chromium es el predeterminado recomendado para este bootstrap; Chrome se puede evaluar si una prueba o integración lo exige explícitamente. No se añade automáticamente ni se sustituye ningún navegador existente por esta recomendación.
+
+[Referencia oficial de Playwright sobre navegadores](https://playwright.dev/docs/browsers).
+
 ## Qué está probado y qué no
 
 Probado (en local, con comandos simulados; ver `tests/`):
