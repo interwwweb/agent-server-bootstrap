@@ -1,5 +1,6 @@
 """Tests de install.sh con comandos simulados: no instalan nada ni usan la red."""
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -208,7 +209,7 @@ class DryRunTests(Base):
     def test_cloud_dry_run_plans_wrangler_workspace_and_wrapper_without_running(self):
         r = self.run_install("--modules", "cloud,node")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertRegex(r.stdout, r"npm install --prefix \S+/tools/wrangler wrangler")
+        self.assertRegex(r.stdout, r"npm install --prefix \S+/tools/wrangler --save-exact wrangler@4\.151\.1")
         self.assertRegex(r.stdout, r"wrapper \S+/\.local/bin/wrangler -> \S+/tools/wrangler/node_modules/\.bin/wrangler")
         self.assertNotIn("wrangler login", r.stdout)
         self.assert_untouched()
@@ -224,7 +225,7 @@ class DryRunTests(Base):
     def test_node_module_plans_pnpm_without_running_npm(self):
         r = self.run_install("--modules", "node")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("npm install -g --no-audit --no-fund pnpm", r.stdout)
+        self.assertIn("npm install -g --no-audit --no-fund pnpm@12.14.0", r.stdout)
         self.assert_untouched()
 
     def test_with_pi_dry_run_plans_pinned_pi_then_extension(self):
@@ -252,7 +253,10 @@ class DryRunTests(Base):
         self.assertNotIn("dangerously", out.lower())
         self.assertIn("--ignore-scripts", out)
         self.assertIn("SHASUMS256.txt", out)
-        self.assertIn("install-deps chromium", out)
+        self.assertNotIn("install-deps", out)
+        self.assertIn("apt-get install -y --no-install-recommends", out)
+        self.assertIn("libnss3", out)
+        self.assertIn("SHA-256", out)
 
 
 class RejectionTests(Base):
@@ -781,7 +785,7 @@ if [ "$1" = prefix ]; then echo "$HOME/.local"; fi
         installs = [c for c in self.calls() if c.startswith("npm install")]
         self.assertEqual(len(installs), 1)
         self.assertIn("-g", installs[0])
-        self.assertTrue(installs[0].endswith(" pnpm"))
+        self.assertTrue(installs[0].endswith(" pnpm@12.14.0"))
         # Si pnpm ya existe, se omite.
         self.fake("pnpm", "")
         self.log.unlink()
@@ -809,6 +813,111 @@ if [ "$1" = prefix ]; then echo "$HOME/.local"; fi
         self.assertIn("--vendor-installers", r.stderr)
         self.assertEqual(self.calls(), [])
 
+    # --- Verificación SHA-256 de scripts de terceros (falla cerrado) --------------------------
+
+    VENDOR_URLS = {
+        "https://astral.sh/uv/install.sh": "7c482d409673a53f4d9bd34ae95c9166be3b8d89ca82f27dd7bca3cab457afff",
+        "https://claude.ai/install.sh": "3a68d3406cf674e17bed1733a4dcf37805e2e47d87417700007d7e1aa766a944",
+        "https://herdr.dev/install.sh": "bf83668c944cff30b3365eee5a4fe15ff61a4b749ab0c73b98e7a203f70893dd",
+        "https://getmoshi.app/install.sh": "36d6beb7d96ae0100920325bdc601ce398984de99b86f222924c3e6a4b722a80",
+    }
+
+    def fake_vendor_curl(self, content):
+        self.fake("curl", f'''echo "curl $*" >> "$MOCK_LOG"
+while [ $# -gt 0 ]; do if [ "$1" = -o ]; then out=$2; fi; shift; done
+printf '%s' '{content}' > "$out"
+''')
+        self.fake_logger("fakeinterp")
+
+    def vendor_run(self, url="https://astral.sh/uv/install.sh", pre=":"):
+        work = self.tmp / "work"
+        work.mkdir(exist_ok=True)
+        return self.sh(f'{hide("uv")}; VENDOR=1; WORK="{work}"; {pre}; download_run uv uv {url} fakeinterp --flag')
+
+    def test_vendor_hashes_are_pinned_for_exactly_the_four_urls(self):
+        for url, digest in self.VENDOR_URLS.items():
+            with self.subTest(url=url):
+                r = self.sh(f'vendor_expected_sha256 "{url}"')
+                self.assertEqual(r.stdout, digest)
+        self.assertEqual(self.sh('vendor_expected_sha256 https://example.invalid/install.sh').returncode, 1)
+
+    def test_vendor_hash_mismatch_fails_closed_before_executing(self):
+        self.fake_vendor_curl("echo contenido-cambiado")
+        r = self.vendor_run()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no coincide", r.stderr)
+        self.assertIn("no se ejecuta", r.stderr)
+        calls = self.calls()
+        self.assertTrue(any(c.startswith("curl ") for c in calls))
+        self.assertEqual([c for c in calls if c.startswith("fakeinterp")], [])
+
+    def test_vendor_hash_match_executes_verified_file_exactly_once(self):
+        import hashlib
+        content = "echo verificado"
+        self.fake_vendor_curl(content)
+        digest = hashlib.sha256(content.encode()).hexdigest()
+        r = self.vendor_run(pre=f'VENDOR_SHA256_UV={digest}')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        runs = [c for c in self.calls() if c.startswith("fakeinterp")]
+        self.assertEqual(len(runs), 1)
+        self.assertTrue(runs[0].endswith(" --flag"))
+
+    def test_vendor_url_without_pinned_hash_never_downloads(self):
+        self.fake_vendor_curl("x")
+        r = self.vendor_run(url="https://example.invalid/install.sh")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no hay un SHA-256 fijado", r.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_vendor_hash_has_no_skip_flag(self):
+        for flag in ("--skip-verification", "--insecure", "--no-verify"):
+            with self.subTest(flag=flag):
+                self.assertEqual(self.run_install(flag).returncode, 2)
+
+    def test_fetch_is_https_only_including_redirects(self):
+        self.fake_vendor_curl("x")
+        out = self.tmp / "out"
+        r = self.sh(f'fetch https://example.invalid/x "{out}"')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        line = next(c for c in self.calls() if c.startswith("curl "))
+        self.assertIn("--proto =https", line)
+        self.assertIn("--proto-redir =https", line)
+        self.assertNotIn("-k", line.split())
+        self.assertNotIn("--insecure", line)
+
+    def test_playwright_sudo_runs_only_system_apt_with_fixed_path_and_per_release_lists(self):
+        self.fake_npm()
+        self.fake_node(24)
+        self.fake_logger("sudo")
+        packages = {"jammy": ("libasound2 ", "libwayland-client0"), "noble": ("libasound2t64", "libatspi2.0-0t64")}
+        for codename, expected in packages.items():
+            with self.subTest(codename=codename):
+                shutil.rmtree(self.home, ignore_errors=True)
+                self.home.mkdir()
+                if self.log.exists():
+                    self.log.unlink()
+                r = self.sh(f'SELECTED="playwright"; OS_CODENAME={codename}; mod_playwright')
+                self.assertEqual(r.returncode, 0, r.stderr)
+                sudo_calls = [c for c in self.calls() if c.startswith("sudo")]
+                self.assertEqual(len(sudo_calls), 2)
+                for call in sudo_calls:
+                    self.assertIn("env PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive apt-get ", call)
+                    for forbidden in ("node_modules", "playwright", "npm", "install-deps", str(self.home)):
+                        self.assertNotIn(forbidden, call)
+                for fragment in expected:
+                    self.assertIn(fragment, sudo_calls[1])
+        r = self.sh('SELECTED="playwright"; OS_CODENAME=focal; mod_playwright')
+        self.assertEqual(r.returncode, 1)
+
+    def test_install_script_has_no_sudo_with_user_path_or_npm_code(self):
+        code = [l for l in INSTALL.read_text().splitlines() if not l.lstrip().startswith("#")]
+        self.assertEqual([l for l in code if "install-deps" in l], [])
+        for line in code:
+            if "run sudo" not in line:
+                continue
+            for forbidden in ('PATH=$PATH', "$pw", "npm", "npx", "node"):
+                self.assertNotIn(forbidden, line)
+
     def test_npm_workspace_preserves_package_json_and_is_idempotent(self):
         self.fake_npm()
         ws = self.home / "ws"
@@ -825,12 +934,16 @@ if [ "$1" = prefix ]; then echo "$HOME/.local"; fi
         self.fake_npm()
         self.fake_node(24)
         self.fake_logger("sudo")
-        script = 'SELECTED="playwright"; mod_playwright'
+        script = 'SELECTED="playwright"; OS_CODENAME=noble; mod_playwright'
         self.assertEqual(self.sh(script).returncode, 0)
         npm_calls = [c for c in self.calls() if c.startswith("npm ")]
         self.assertEqual(len(npm_calls), 1)
-        self.assertIn("@playwright/test @playwright/cli", npm_calls[0])
-        self.assertTrue(any("install-deps chromium" in c for c in self.calls()))
+        self.assertIn("--save-exact @playwright/test@1.64.1 @playwright/cli@0.1.22", npm_calls[0])
+        sudo_calls = [c for c in self.calls() if c.startswith("sudo")]
+        self.assertEqual(len(sudo_calls), 2)  # apt-get update + apt-get install; nada más con sudo
+        self.assertIn("apt-get update", sudo_calls[0])
+        self.assertIn("apt-get install -y --no-install-recommends", sudo_calls[1])
+        self.assertIn("libasound2t64", sudo_calls[1])
         self.assertTrue(any(c.endswith("install chromium") for c in self.calls() if c.startswith("BIN")))
         wrappers = [self.home / ".local/bin/playwright", self.home / ".local/bin/playwright-cli"]
         before = [w.read_text() for w in wrappers]
@@ -865,7 +978,8 @@ if [ "$1" = prefix ]; then echo "$HOME/.local"; fi
         self.assertEqual(len(installs), 1)
         self.assertIn("--prefix", installs[0])
         self.assertIn("agent-server-bootstrap/tools/wrangler", installs[0])
-        self.assertTrue(installs[0].endswith(" wrangler"))
+        self.assertTrue(installs[0].endswith(" wrangler@4.151.1"))
+        self.assertIn("--save-exact", installs[0])
         self.assertNotIn(" -g ", installs[0])
         self.assertFalse(any(c.startswith("sudo") for c in self.calls()))
         wrapper = self.home / ".local/bin/wrangler"
@@ -1054,6 +1168,73 @@ printf 'deadbeef  node-v24.1.0-linux-x64.tar.gz\\n' > "$out"
         text = w.read_text()
         self.assertIn("exec /abs/dir/bin/tool", text)
         self.assertIn(str(fake), text)
+
+
+class SupplyChainTests(Base):
+    """Pines y CI comprobados de forma estática (sin red)."""
+
+    PINS = {
+        "PNPM": "12.14.0", "CODEX": "0.163.0", "VERCEL": "64.5.0", "SANITY": "8.19.0",
+        "SUPABASE": "2.121.0", "WRANGLER": "4.151.1", "PLAYWRIGHT_TEST": "1.64.1",
+        "PLAYWRIGHT_CLI": "0.1.22", "LINEAR": "3.0.0", "PI": "0.87.1",
+    }
+    CHECKOUT = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+    SETUP_NODE = "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020"
+    GITLEAKS_SHA = "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+
+    def code_lines(self):
+        return [l for l in INSTALL.read_text().splitlines() if not l.lstrip().startswith("#")]
+
+    def test_direct_npm_versions_are_central_exact_and_used(self):
+        pins = dict(re.findall(r"^([A-Z_]+)_VERSION=(\S+)$", INSTALL.read_text(), re.M))
+        for name, version in self.PINS.items():
+            self.assertEqual(pins.get(name), version, name)
+        code = "\n".join(self.code_lines())
+        for name in self.PINS:
+            if name in ("PI",):
+                continue
+            self.assertRegex(code, rf"(npm_global|npm_workspace).*@\${name}_VERSION", name)
+        self.assertNotIn("@latest", code)
+        for line in code.splitlines():
+            if "npm_workspace" in line and "npm_workspace()" not in line and "dir=" not in line:
+                self.assertIn("--save-exact", line)
+
+    def test_actions_are_pinned_to_full_commit_sha(self):
+        text = (ROOT / ".github/workflows/ci.yml").read_text()
+        uses = re.findall(r"uses:\s*(\S+)", text)
+        self.assertTrue(uses)
+        for u in uses:
+            self.assertRegex(u, r"^[\w.-]+/[\w.-]+@[0-9a-f]{40}$")
+        self.assertIn(self.CHECKOUT, text)
+        self.assertIn(self.SETUP_NODE, text)
+        self.assertNotIn("@v4\n", text)
+
+    def test_dependabot_updates_github_actions_weekly(self):
+        text = (ROOT / ".github/dependabot.yml").read_text()
+        self.assertIn('package-ecosystem: "github-actions"', text)
+        self.assertIn('interval: "weekly"', text)
+
+    def test_gitleaks_job_uses_verified_official_binary_without_marketplace_action(self):
+        text = (ROOT / ".github/workflows/ci.yml").read_text()
+        self.assertIn(self.GITLEAKS_SHA, text)
+        self.assertIn('GITLEAKS_VERSION: "8.30.1"', text)
+        self.assertIn("sha256sum -c -", text)
+        self.assertIn("fetch-depth: 0", text)
+        self.assertIn("--redact", text)
+        self.assertIn("--proto-redir '=https'", text)
+        self.assertNotIn("gitleaks-action", text)
+        self.assertNotIn("secrets.", text)
+        self.assertNotIn("GITLEAKS_LICENSE", text)
+
+    def test_playwright_apt_lists_match_pinned_release(self):
+        text = INSTALL.read_text()
+        self.assertIn("tag v1.64.1", text)
+        self.assertEqual(self.PINS["PLAYWRIGHT_TEST"], "1.64.1")
+        for arr, needle in (("PW_APT_JAMMY", "libasound2 "), ("PW_APT_NOBLE", "libasound2t64")):
+            body = re.search(rf"^{arr}=\((.*?)^\)", text, re.M | re.S).group(1)
+            self.assertIn(needle, body)
+            self.assertIn("libnss3", body)
+            self.assertNotIn("$", body)  # solo literales: nada de expansiones ni salida de código
 
 
 class DoctorTests(Base):

@@ -1,0 +1,7 @@
+version: 2
+updates:
+  # Mantiene al día los SHA fijados de las acciones de GitHub (se revisan como cualquier otro cambio).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

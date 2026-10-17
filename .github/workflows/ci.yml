@@ -16,7 +16,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-22.04]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       - name: Sintaxis bash
@@ -31,6 +31,33 @@ jobs:
       - name: Tests (comandos simulados, sin instalar nada)
         run: python3 -I -m unittest discover -s tests -v
 
+  secrets:
+    name: escaneo de secretos (gitleaks 8.30.1)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # Binario oficial de gitleaks (sin acción de marketplace ni cuentas externas) con SHA-256 literal revisado:
+      # el de gitleaks_8.30.1_linux_x64.tar.gz según gitleaks_8.30.1_checksums.txt de la release v8.30.1.
+      - name: Descargar y verificar gitleaks
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          set -euo pipefail
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 \
+            -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${tarball}"
+          echo "${GITLEAKS_SHA256}  ${RUNNER_TEMP}/${tarball}" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/gitleaks"
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/gitleaks" gitleaks
+      - name: gitleaks (historial completo, valores ocultos)
+        run: '"$RUNNER_TEMP/gitleaks/gitleaks" git . --redact'
+
   pi-integration:
     name: integración real de Pi (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -39,10 +66,10 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-22.04]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
       - name: Pi y pi-selection-editor reales en un HOME aislado (usa red)
@@ -57,7 +84,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-22.04]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       - name: Paquete oficial de Tailscale en un runner efímero (usa red; sin login)
@@ -74,10 +101,10 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-22.04]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
       - name: Linear CLI comunitaria fijada en un HOME aislado (usa red; sin tokens)

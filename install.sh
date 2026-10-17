@@ -16,6 +16,37 @@ PI_VERSION=0.87.1
 PI_EXT_URL="https://github.com/interwwweb/pi-selection-editor.git"
 PI_EXT_TAG=v0.1.2
 PI_EXT_COMMIT=93d60682e2aeca492d05c19ca3dbc3b46f360241
+# Versiones npm directas, fijadas en un único sitio (latest del registro de npm el 18/10/2026).
+# Fijan solo los paquetes directos: sus dependencias transitivas NO están bloqueadas (sin lockfile
+# versionado), así que no hay reproducibilidad completa. Se actualizan a propósito, revisándolas.
+PNPM_VERSION=12.14.0
+CODEX_VERSION=0.163.0
+VERCEL_VERSION=64.5.0
+SANITY_VERSION=8.19.0
+SUPABASE_VERSION=2.121.0
+WRANGLER_VERSION=4.151.1
+PLAYWRIGHT_TEST_VERSION=1.64.1
+PLAYWRIGHT_CLI_VERSION=0.1.22
+# Camino fijo para el apt que se ejecuta con sudo: nunca el PATH del usuario (que puede traer Node/npm).
+SUDO_SAFE_PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+# Dependencias de sistema de Chromium para Playwright, mantenidas a mano: «tools» + «chromium» de
+# packages/playwright-core/src/server/registry/nativeDeps.ts en el tag v1.64.1 (= PLAYWRIGHT_TEST_VERSION),
+# entradas ubuntu22.04-x64 / ubuntu24.04-x64 (las arm64 son copias de esas). Al subir Playwright hay que
+# volver a copiarlas. Solo se pasan a `apt-get install`; nunca se ejecuta código de npm con sudo.
+PW_APT_JAMMY=(
+  xvfb fonts-noto-color-emoji fonts-unifont libfontconfig1 libfreetype6 xfonts-cyrillic xfonts-scalable
+  fonts-liberation fonts-ipafont-gothic fonts-wqy-zenhei fonts-tlwg-loma-otf fonts-freefont-ttf
+  libasound2 libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 libcairo2 libcups2 libdbus-1-3 libdrm2 libgbm1
+  libglib2.0-0 libnspr4 libnss3 libpango-1.0-0 libwayland-client0 libx11-6 libxcb1 libxcomposite1
+  libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2
+)
+PW_APT_NOBLE=(
+  xvfb fonts-noto-color-emoji fonts-unifont libfontconfig1 libfreetype6 xfonts-cyrillic xfonts-scalable
+  fonts-liberation fonts-ipafont-gothic fonts-wqy-zenhei fonts-tlwg-loma-otf fonts-freefont-ttf
+  libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 libcairo2 libcups2t64 libdbus-1-3
+  libdrm2 libgbm1 libglib2.0-0t64 libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1
+  libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2
+)
 # Linear CLI COMUNITARIA (schpet/linear-cli, no es oficial de Linear), fijada en una versión exacta.
 LINEAR_PKG="@schpet/linear-cli"
 LINEAR_VERSION=3.0.0
@@ -187,7 +218,7 @@ preflight() {
     local c
     for c in tar sha256sum mktemp; do need "$c"; done
     if ! selected base && { selected node || vendor_selected; }; then need curl; fi
-    if selected base || selected docker; then need apt-get; fi
+    if selected base || selected docker || selected playwright; then need apt-get; fi
     if selected tailscale; then ts_preflight; fi
     if selected base || selected docker || selected playwright || { selected tailscale && ! ts_complete; }; then
       need sudo
@@ -254,21 +285,50 @@ run() {
   if [ "$APPLY" = 1 ]; then log "+ $*"; "$@"; else log "[dry-run] $*"; fi
 }
 
-fetch() { curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$2" "$1"; }
+# Solo HTTPS, también en las redirecciones (--proto-redir): una redirección a http se rechaza.
+fetch() { curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 -o "$2" "$1"; }
 
-# Descarga a un archivo temporal y lo ejecuta con el intérprete indicado (nunca curl | sh).
+sha256_of() { # archivo -> hash en hexadecimal
+  if have sha256sum; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+# SHA-256 del contenido final (tras seguir redirecciones HTTPS) de los 4 scripts de terceros, obtenido y
+# revisado el 18/10/2026. Fija QUÉ script se ejecuta; no audita lo que ese script descarga después
+# (segunda etapa) y los scripts «latest» (uv, Claude Code) cambiarán de hash en cada versión nueva:
+# entonces falla cerrado hasta que se revise y actualice aquí. No hay opción para saltarse la verificación.
+VENDOR_SHA256_UV="7c482d409673a53f4d9bd34ae95c9166be3b8d89ca82f27dd7bca3cab457afff"
+VENDOR_SHA256_CLAUDE="3a68d3406cf674e17bed1733a4dcf37805e2e47d87417700007d7e1aa766a944"
+VENDOR_SHA256_HERDR="bf83668c944cff30b3365eee5a4fe15ff61a4b749ab0c73b98e7a203f70893dd"
+VENDOR_SHA256_MOSHI="36d6beb7d96ae0100920325bdc601ce398984de99b86f222924c3e6a4b722a80"
+
+vendor_expected_sha256() { # url
+  case "$1" in
+    https://astral.sh/uv/install.sh) printf '%s' "$VENDOR_SHA256_UV" ;;
+    https://claude.ai/install.sh) printf '%s' "$VENDOR_SHA256_CLAUDE" ;;
+    https://herdr.dev/install.sh) printf '%s' "$VENDOR_SHA256_HERDR" ;;
+    https://getmoshi.app/install.sh) printf '%s' "$VENDOR_SHA256_MOSHI" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Descarga a un archivo temporal, verifica su SHA-256 fijado y SOLO entonces lo ejecuta (nunca curl | sh).
 download_run() { # nombre binario url intérprete [args...]
-  local name=$1 bin=$2 url=$3 interp=$4 f; shift 4
+  local name=$1 bin=$2 url=$3 interp=$4 f expected actual; shift 4
   if have "$bin"; then log "  $name: '$bin' ya existe, se omite"; return 0; fi
   if [ "$APPLY" = 1 ] && [ "$VENDOR" != 1 ]; then die "$name es un script de terceros: requiere --vendor-installers"; fi
+  expected=$(vendor_expected_sha256 "$url") || die "no hay un SHA-256 fijado para $url: no se ejecuta"
   if [ "$APPLY" != 1 ]; then
-    log "[dry-run] $name: descargar $url a un archivo temporal y ejecutar '$interp <archivo> $*'"
+    log "[dry-run] $name: descargar $url a un archivo temporal, verificar SHA-256 $expected y ejecutar '$interp <archivo> $*'"
     return 0
   fi
   f=$(mktemp "$WORK/dl.XXXXXX")
   log "+ curl $url -> $f"
   fetch "$url" "$f"
   [ -s "$f" ] || die "descarga vacía: $url"
+  actual=$(sha256_of "$f")
+  if [ "$actual" != "$expected" ]; then
+    die "el SHA-256 de $name no coincide (esperado $expected, obtenido $actual): no se ejecuta; revisa el script y actualiza el hash fijado"
+  fi
   log "+ $interp <archivo> $*"
   ( cd "$HOME" && "$interp" "$f" "$@" )
 }
@@ -506,7 +566,7 @@ mod_node() {
     install_node
     node_ok || die "tras la instalación, node no es >= $NODE_MAJOR con npm"
   fi
-  npm_global pnpm pnpm
+  npm_global pnpm "pnpm@$PNPM_VERSION"
 }
 
 mod_python() {
@@ -517,7 +577,7 @@ mod_python() {
 mod_agents() {
   log "== agents: Codex, Claude Code, Herdr (Pi opcional) =="
   require_node agents
-  npm_global codex @openai/codex
+  npm_global codex "@openai/codex@$CODEX_VERSION"
   download_run "Claude Code" claude https://claude.ai/install.sh bash stable
   if [ "$WITH_PI" = 1 ]; then pi_install; configure_pi; fi
   download_run Herdr herdr https://herdr.dev/install.sh sh
@@ -532,7 +592,7 @@ mod_wrangler() {
     log "  wrangler: 'wrangler' ya existe, se omite"
     return 0
   fi
-  if [ ! -x "$ws/node_modules/.bin/wrangler" ] || [ "$APPLY" != 1 ]; then npm_workspace "$ws" wrangler; fi
+  if [ ! -x "$ws/node_modules/.bin/wrangler" ] || [ "$APPLY" != 1 ]; then npm_workspace "$ws" --save-exact "wrangler@$WRANGLER_VERSION"; fi
   write_wrapper wrangler "$ws/node_modules/.bin/wrangler"
 }
 
@@ -554,13 +614,13 @@ mod_linear() {
 mod_cloud() {
   log "== cloud: vercel, sanity, supabase, wrangler, linear =="
   require_node cloud
-  npm_global vercel vercel
-  npm_global sanity @sanity/cli
+  npm_global vercel "vercel@$VERCEL_VERSION"
+  npm_global sanity "@sanity/cli@$SANITY_VERSION"
   if have supabase; then
     log "  supabase: 'supabase' ya existe, se omite"
   else
     local ws=$TOOLS/supabase
-    if [ ! -x "$ws/node_modules/.bin/supabase" ] || [ "$APPLY" != 1 ]; then npm_workspace "$ws" supabase; fi
+    if [ ! -x "$ws/node_modules/.bin/supabase" ] || [ "$APPLY" != 1 ]; then npm_workspace "$ws" --save-exact "supabase@$SUPABASE_VERSION"; fi
     write_wrapper supabase "$ws/node_modules/.bin/supabase"
   fi
   mod_wrangler
@@ -620,12 +680,22 @@ mod_playwright() {
   log "== playwright: @playwright/test y @playwright/cli en un workspace dedicado =="
   require_node playwright
   local ws=$TOOLS/playwright pw
+  local -a pkgs
   pw=$ws/node_modules/.bin/playwright
-  if [ ! -x "$pw" ] || [ "$APPLY" != 1 ]; then npm_workspace "$ws" @playwright/test @playwright/cli; fi
+  case "$OS_CODENAME" in
+    jammy) pkgs=("${PW_APT_JAMMY[@]}") ;;
+    noble) pkgs=("${PW_APT_NOBLE[@]}") ;;
+    *) die "codename de Ubuntu no determinado o no admitido para Playwright: '$OS_CODENAME'" ;;
+  esac
+  if [ ! -x "$pw" ] || [ "$APPLY" != 1 ]; then
+    npm_workspace "$ws" --save-exact "@playwright/test@$PLAYWRIGHT_TEST_VERSION" "@playwright/cli@$PLAYWRIGHT_CLI_VERSION"
+  fi
   write_wrapper playwright "$pw"
   write_wrapper playwright-cli "$ws/node_modules/.bin/playwright-cli"
-  # Equivalente a «install --with-deps»: dependencias del sistema con sudo y navegador como usuario.
-  run sudo env "PATH=$PATH" "$pw" install-deps chromium
+  # Dependencias de sistema: SOLO apt-get con sudo y un PATH fijo, con una lista mantenida aquí (nunca
+  # se ejecuta con sudo código de npm ni la salida de código descargado). El navegador se instala como usuario.
+  selected base || run sudo env "PATH=$SUDO_SAFE_PATH" DEBIAN_FRONTEND=noninteractive apt-get update
+  run sudo env "PATH=$SUDO_SAFE_PATH" DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${pkgs[@]}"
   run "$pw" install chromium
 }
 
