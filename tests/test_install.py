@@ -22,6 +22,11 @@ EXT_URL = "https://github.com/interwwweb/pi-selection-editor.git"
 PI_HIDE = 'have() { if [ "$1" = pi ] && [ ! -x "$FAKEBIN/pi" ]; then return 1; fi; command -v "$1" >/dev/null 2>&1; }'
 
 
+# Oculta tailscale/tailscaled hasta que un apt-get simulado cree FAKEBIN/<nombre>.
+TS_HIDE = ('have() { if { [ "$1" = tailscale ] || [ "$1" = tailscaled ]; } && [ ! -x "$FAKEBIN/$1" ]; '
+           'then return 1; fi; command -v "$1" >/dev/null 2>&1; }')
+
+
 def hide(*names):
     """Código bash que redefine `have` para ocultar comandos concretos y delega el resto."""
     cond = " || ".join(f'[ "$1" = {n} ]' for n in names)
@@ -151,7 +156,7 @@ class DryRunTests(Base):
                     r = self.run_install(release=self.release(version=version), arch=arch)
                     self.assertEqual(r.returncode, 0, r.stderr)
                     self.assertIn("DRY-RUN", r.stdout)
-                    for mod in ("base", "node", "python", "agents", "cloud", "remote", "playwright"):
+                    for mod in ("base", "node", "python", "agents", "cloud", "remote", "tailscale", "playwright"):
                         self.assertIn(f"== {mod}", r.stdout)
                     self.assertNotIn("== docker", r.stdout)
                     self.assert_untouched()
@@ -173,9 +178,32 @@ class DryRunTests(Base):
             with self.subTest(module=mod):
                 r = self.run_install("--modules", mod)
                 self.assertEqual(r.stdout.count("crear "), 1)
-        for mod in ("base", "docker"):
+        for mod in ("base", "docker", "tailscale"):
             with self.subTest(module=mod):
                 self.assertNotIn("crear ", self.run_install("--modules", mod).stdout)
+
+    def test_tailscale_is_default_and_dry_run_plans_signed_apt_repo(self):
+        for version, codename in (("22.04", "jammy"), ("24.04", "noble")):
+            with self.subTest(codename=codename):
+                r = self.run_install("--modules", "tailscale", release=self.release(version=version))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                out = r.stdout
+                self.assertIn(f"https://pkgs.tailscale.com/stable/ubuntu/{codename}.noarmor.gpg", out)
+                self.assertIn(
+                    f"deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] "
+                    f"https://pkgs.tailscale.com/stable/ubuntu {codename} main", out)
+                self.assertIn("/etc/apt/sources.list.d/tailscale.list", out)
+                self.assertIn("apt-get install -y tailscale", out)
+                self.assertNotIn("tailscale up", out)
+                self.assertNotIn("== base", out)
+                self.assert_untouched()
+        self.assertIn("== tailscale", self.run_install().stdout)
+
+    def test_tailscale_apply_does_not_need_vendor_flag(self):
+        r = subprocess.run(
+            [BASH, "-c", f'set -euo pipefail; . "{INSTALL}"; APPLY=1; YES=1; MODULES_SET=1; MODULES=tailscale; validate_args'],
+            env=self.env(), capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_node_module_plans_pnpm_without_running_npm(self):
         r = self.run_install("--modules", "node")
@@ -489,6 +517,180 @@ case "$*" in *pi-coding-agent*) printf '#!/bin/sh\\necho 0.87.1\\n' > "$FAKEBIN/
         self.assertEqual(settings.read_text(), '{"mio": true}\n')
         self.assertEqual(sorted(p.name for p in agent_dir.iterdir()), ["settings.json"])
 
+    # --- Tailscale (repositorio apt oficial firmado) ----------------------------------------
+
+    def ts_paths(self):
+        etc = self.tmp / "etc"
+        return etc / "keyrings/tailscale-archive-keyring.gpg", etc / "apt/sources.list.d/tailscale.list"
+
+    def ts_run(self, body="mod_tailscale", codename="noble", **extra):
+        key, lst = self.ts_paths()
+        work = self.tmp / "work"
+        work.mkdir(exist_ok=True)
+        setup = (f'TS_KEYRING="{key}"; TS_LIST="{lst}"; TS_SBIN_DAEMON="{self.tmp}/no-existe/tailscaled"; '
+                 f'CA_BUNDLE="{self.tmp}/no-existe/ca.crt"; WORK="{work}"; OS_CODENAME={codename}; SELECTED=tailscale')
+        return self.sh(f'{TS_HIDE}; {setup}; {body}', FAKEBIN=str(self.bin), **extra)
+
+    def fake_ts_env(self):
+        self.fake("curl", '''echo "curl $*" >> "$MOCK_LOG"
+while [ $# -gt 0 ]; do if [ "$1" = -o ]; then out=$2; fi; shift; done
+printf 'KEYDATA' > "$out"
+''')
+        self.fake("sudo", 'echo "sudo $*" >> "$MOCK_LOG"\nexec "$@"\n')
+        self.fake("apt-get", '''echo "apt-get $*" >> "$MOCK_LOG"
+case "$*" in *"install -y tailscale"*)
+  for b in tailscale tailscaled; do
+    printf '#!/bin/sh\\necho "tailscale-fake $0 $*" >> "$MOCK_LOG"\\n' > "$FAKEBIN/$b"; chmod 755 "$FAKEBIN/$b"
+  done ;; esac
+''')
+
+    def test_tailscale_constants_are_official_paths(self):
+        r = self.sh('printf "%s\\n%s\\n%s\\n" "$TS_BASE" "$TS_KEYRING" "$TS_LIST"')
+        self.assertEqual(r.stdout.split(), [
+            "https://pkgs.tailscale.com/stable/ubuntu",
+            "/usr/share/keyrings/tailscale-archive-keyring.gpg",
+            "/etc/apt/sources.list.d/tailscale.list"])
+
+    def test_tailscale_skips_existing_pair_before_any_network_or_sudo(self):
+        self.fake_ts_env()
+        self.fake("tailscale", "")
+        self.fake("tailscaled", "")
+        r = self.ts_run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("se omite", r.stdout)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse((self.tmp / "etc").exists())
+
+    def test_tailscale_partial_install_fails_without_changes(self):
+        self.fake_ts_env()
+        self.fake("tailscale", "")
+        r = self.ts_run()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("parcial", r.stderr)
+        (self.bin / "tailscale").unlink()
+        self.fake("tailscaled", "")
+        r = self.ts_run()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("parcial", r.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse((self.tmp / "etc").exists())
+
+    def test_tailscale_installs_key_list_then_apt_in_order_without_auth(self):
+        self.fake_ts_env()
+        for codename in ("jammy", "noble"):
+            with self.subTest(codename=codename):
+                shutil.rmtree(self.tmp / "etc", ignore_errors=True)
+                for b in ("tailscale", "tailscaled"):
+                    (self.bin / b).unlink(missing_ok=True)
+                if self.log.exists():
+                    self.log.unlink()
+                r = self.ts_run(codename=codename)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                key, lst = self.ts_paths()
+                self.assertEqual(key.read_text(), "KEYDATA")
+                self.assertEqual(
+                    lst.read_text().splitlines()[1],
+                    f"deb [signed-by={key}] https://pkgs.tailscale.com/stable/ubuntu {codename} main")
+                self.assertEqual(stat.S_IMODE(key.stat().st_mode), 0o644)
+                self.assertEqual(stat.S_IMODE(lst.stat().st_mode), 0o644)
+                self.assertEqual(stat.S_IMODE(key.parent.stat().st_mode), 0o755)
+                calls = self.calls()
+                self.assertIn(f"https://pkgs.tailscale.com/stable/ubuntu/{codename}.noarmor.gpg", calls[0])
+                order = [self.call_index(f) for f in (f"sudo install -m0644 {self.tmp}/work/tailscale.gpg {key}",
+                                                      f"sudo install -m0644 {self.tmp}/work/tailscale.list {lst}",
+                                                      "apt-get update", "apt-get install -y tailscale")]
+                self.assertEqual(order, sorted(order))
+                self.assertEqual([c for c in calls if c.startswith("tailscale-fake")], [])
+
+    def test_tailscale_conflicts_preserve_everything_and_write_nothing(self):
+        self.fake_ts_env()
+        key, lst = self.ts_paths()
+        decoy = self.tmp / "decoy"
+
+        def key_differs():
+            key.parent.mkdir(parents=True); key.write_text("otra clave")
+
+        def list_differs():
+            lst.parent.mkdir(parents=True); lst.write_text("deb otra cosa\n")
+
+        def key_symlink_same_bytes():
+            key.parent.mkdir(parents=True); decoy.write_text("KEYDATA"); key.symlink_to(decoy)
+
+        def key_dangling_symlink():
+            key.parent.mkdir(parents=True); key.symlink_to(self.tmp / "no-existe")
+
+        def list_symlink():
+            lst.parent.mkdir(parents=True); decoy.write_text("x"); lst.symlink_to(decoy)
+
+        def key_is_directory():
+            key.mkdir(parents=True)
+
+        cases = ((key_differs, lst), (list_differs, key), (key_symlink_same_bytes, lst),
+                 (key_dangling_symlink, lst), (list_symlink, key), (key_is_directory, lst))
+        for setup, other in cases:
+            with self.subTest(case=setup.__name__):
+                shutil.rmtree(self.tmp / "etc", ignore_errors=True)
+                decoy.unlink(missing_ok=True)
+                if self.log.exists():
+                    self.log.unlink()
+                setup()
+                r = self.ts_run()
+                self.assertEqual(r.returncode, 1)
+                self.assertIn("no se modifica ninguno", r.stderr)
+                self.assertFalse(os.path.lexists(other), "se escribió el otro archivo")
+                self.assertEqual([c for c in self.calls() if c.startswith(("sudo", "apt-get"))], [])
+        key_differs_state = (self.tmp / "etc")
+        shutil.rmtree(key_differs_state, ignore_errors=True)
+        key_differs()
+        self.ts_run()
+        self.assertEqual(key.read_text(), "otra clave")
+
+    def test_tailscale_second_run_with_identical_files_only_runs_apt(self):
+        self.fake_ts_env()
+        self.assertEqual(self.ts_run().returncode, 0)
+        key, lst = self.ts_paths()
+        before = (key.read_bytes(), lst.read_bytes())
+        for b in ("tailscale", "tailscaled"):
+            (self.bin / b).unlink()
+        self.log.unlink()
+        r = self.ts_run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([c for c in self.calls() if c.startswith("sudo install ")], [])
+        self.assertTrue(any("apt-get install -y tailscale" in c for c in self.calls()))
+        self.assertEqual((key.read_bytes(), lst.read_bytes()), before)
+
+    def test_tailscale_empty_key_download_aborts_before_writing(self):
+        self.fake_ts_env()
+        self.fake("curl", 'while [ $# -gt 0 ]; do if [ "$1" = -o ]; then : > "$2"; fi; shift; done\n')
+        r = self.ts_run()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("descarga vacía", r.stderr)
+        self.assertFalse((self.tmp / "etc").exists())
+
+    def test_tailscale_refuses_unknown_codename(self):
+        self.fake_ts_env()
+        r = self.ts_run(codename="evil")
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(self.calls(), [])
+
+    def test_ts_preflight_requirements(self):
+        h_curl = hide("tailscale", "tailscaled", "curl")
+        r = self.ts_run(body="ts_preflight")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("ca-certificates", r.stderr)
+        self.assertEqual(self.ts_run(body=f'{h_curl}; ts_preflight').returncode, 1)
+        ca = self.tmp / "ca.crt"
+        ca.write_text("")
+        self.assertEqual(self.ts_run(body=f'CA_BUNDLE="{ca}"; ts_preflight').returncode, 0)
+        r = self.ts_run(body=f'{h_curl}; SELECTED="base tailscale"; ts_preflight')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.fake("tailscale", "")
+        r = self.ts_run(body='ts_preflight')  # solo tailscale existe: instalación parcial
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("parcial", r.stderr)
+        self.fake("tailscaled", "")
+        self.assertEqual(self.ts_run(body='ts_preflight').returncode, 0)
+
     def test_mod_node_installs_pnpm_with_npm_global_after_node(self):
         self.fake_node(24)
         self.fake("npm", '''echo "npm $*" >> "$MOCK_LOG"
@@ -718,6 +920,31 @@ class DoctorTests(Base):
     def test_without_with_pi_no_extension_checks(self):
         r = self.run_doctor("--modules", "agents")
         self.assertNotIn("pi-selection-editor", r.stdout)
+
+    def test_tailscale_missing_is_reported(self):
+        r = self.run_doctor("--modules", "tailscale")
+        self.assertEqual(r.returncode, 1)
+        self.assertRegex(r.stdout, r"(?m)^FALTA\s+tailscale$")
+
+    def test_tailscale_checked_by_existence_and_version_subcommand_only(self):
+        d = self.tmp / "tsbin"
+        d.mkdir()
+        for name in ("tailscale", "tailscaled"):
+            p = d / name
+            p.write_text('#!/bin/sh\necho "ts-fake ' + name + ' $*" >> "$MOCK_LOG"\necho "1.2.3"\n')
+            p.chmod(0o755)
+        r = self.run_doctor("--modules", "tailscale", "--versions", path=f"{d}:{self.mock}:/usr/bin:/bin")
+        self.assertRegex(r.stdout, r"ok\s+tailscale \(")
+        self.assertRegex(r.stdout, r"ok\s+tailscaled \(")
+        self.assertRegex(r.stdout, r"(?m)^tailscale\s+1\.2\.3$")
+        self.assertNotRegex(r.stdout, r"FALLO\s+tailscale")
+        # Los mocks prohibidos (git, npm…) también registran sus llamadas: solo importan las de Tailscale.
+        ts_calls = [c for c in self.log.read_text().splitlines() if c.startswith("ts-fake")]
+        self.assertEqual(ts_calls, ["ts-fake tailscale version"])
+
+    def test_default_modules_include_tailscale(self):
+        r = self.run_doctor()
+        self.assertRegex(r.stdout, r"(?m)^FALTA\s+tailscale$")
 
     def test_empty_modules_rejected(self):
         for value in ("", ",", " , "):

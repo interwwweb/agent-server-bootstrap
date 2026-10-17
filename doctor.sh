@@ -6,7 +6,7 @@ set -f # sin expansión de globs al procesar la lista de módulos
 
 PROG="agent-server-bootstrap"
 ASB_HOME="$HOME/.local/share/$PROG"
-DEFAULT_MODULES="base node python agents cloud remote playwright"
+DEFAULT_MODULES="base node python agents cloud remote tailscale playwright"
 KNOWN_MODULES="$DEFAULT_MODULES docker"
 NODE_MAJOR=24
 MODULES="" MODULES_SET=0 SMOKE=0 VERSIONS=0 WITH_PI=0 MISSING=0
@@ -17,7 +17,7 @@ Uso: ./doctor.sh [opciones]
 
   --modules LISTA   Módulos a comprobar (no puede ir vacía; por defecto los mismos
                     que install.sh, sin docker).
-                    Disponibles: base node python agents cloud remote playwright docker
+                    Disponibles: base node python agents cloud remote tailscale playwright docker
   --with-pi         Comprueba también pi (versión >=0.87.1 <0.88.0) y la extensión
                     pi-selection-editor (clon, commit fijado y enlace estable);
                     requiere el módulo agents.
@@ -120,6 +120,8 @@ selected python && check uv
 if selected agents; then check codex; check claude; check herdr; if [ "$WITH_PI" = 1 ]; then check pi; if have pi; then check_pi_version; fi; check_pi_extension; fi; fi
 selected cloud && for c in vercel sanity supabase; do check "$c"; done
 selected remote && { check moshi-hook; check mosh; }
+# Solo existencia: no se consulta estado, IP, red ni autenticación de Tailscale. tailscaled vive en /usr/sbin.
+selected tailscale && { check tailscale; check tailscaled /usr/sbin/tailscaled; }
 selected playwright && { check playwright; check playwright-cli; }
 selected docker && check docker
 
@@ -133,14 +135,17 @@ if [ "$VERSIONS" = 1 ]; then
     ( . /etc/os-release; echo "so: ${PRETTY_NAME:-desconocido}" )
   fi
   echo "arquitectura: $(uname -m)"
-  for c in git node npm pnpm python3 uv jq rg tmux mosh gh codex claude herdr pi vercel sanity supabase playwright docker; do
+  for c in git node npm pnpm python3 uv jq rg tmux mosh gh codex claude herdr pi vercel sanity supabase playwright docker tailscale; do
     if have "$c"; then
       rc=0
-      out=$("$c" --version 2>&1) || rc=$?
+      vflag=--version
+      # Tailscale documenta el subcomando `version`; no se consulta estado ni red.
+      if [ "$c" = tailscale ]; then vflag=version; fi
+      out=$("$c" "$vflag" 2>&1) || rc=$?
       if [ "$rc" -eq 0 ]; then
         printf '%-12s %s\n' "$c" "${out%%$'\n'*}"
       else
-        printf 'FALLO    %-12s existe pero "--version" terminó con código %s: %s\n' "$c" "$rc" "${out%%$'\n'*}"
+        printf 'FALLO    %-12s existe pero "%s" terminó con código %s: %s\n' "$c" "$vflag" "$rc" "${out%%$'\n'*}"
         MISSING=$((MISSING + 1))
       fi
     fi

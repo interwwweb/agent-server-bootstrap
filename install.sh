@@ -4,7 +4,7 @@
 set -euo pipefail
 
 PROG="agent-server-bootstrap"
-DEFAULT_MODULES="base node python agents cloud remote playwright"
+DEFAULT_MODULES="base node python agents cloud remote tailscale playwright"
 KNOWN_MODULES="$DEFAULT_MODULES docker"
 NODE_MAJOR=24
 NODE_DIST="https://nodejs.org/dist/latest-v${NODE_MAJOR}.x"
@@ -16,6 +16,14 @@ PI_VERSION=0.87.1
 PI_EXT_URL="https://github.com/interwwweb/pi-selection-editor.git"
 PI_EXT_TAG=v0.1.2
 PI_EXT_COMMIT=93d60682e2aeca492d05c19ca3dbc3b46f360241
+# Tailscale: repositorio apt oficial firmado. Rutas y URL son constantes; solo los tests que cargan
+# las funciones con `source` las sobrescriben (main no lee overrides del entorno).
+TS_BASE="https://pkgs.tailscale.com/stable/ubuntu"
+TS_KEYRING="/usr/share/keyrings/tailscale-archive-keyring.gpg"
+TS_LIST="/etc/apt/sources.list.d/tailscale.list"
+TS_SBIN_DAEMON="/usr/sbin/tailscaled"
+CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt"
+OS_CODENAME=""
 
 ASB_HOME="$HOME/.local/share/$PROG"
 LOCAL_BIN="$HOME/.local/bin"
@@ -58,8 +66,8 @@ Opciones:
   --yes, -y               Confirma --apply.
   --dry-run               Modo por defecto, explícito.
   --modules LISTA         Módulos separados por comas (no puede ir vacía). Por defecto:
-                          base,node,python,agents,cloud,remote,playwright
-                          Disponibles: base node python agents cloud remote playwright docker
+                          base,node,python,agents,cloud,remote,tailscale,playwright
+                          Disponibles: base node python agents cloud remote tailscale playwright docker
   --with-docker           Añade el módulo docker (opcional).
   --with-pi               Instala también Pi fijado en 0.87.1 (si falta; uno existente debe ser
                           0.87.x con x>=1) y la extensión pi-selection-editor v0.1.2 (commit
@@ -155,7 +163,12 @@ preflight() {
   # shellcheck source=/dev/null
   ver=$( . "$osr" >/dev/null 2>&1; printf '%s' "${VERSION_ID:-}" )
   [ "$id" = ubuntu ] || die "sistema no admitido ($id): solo Ubuntu 22.04/24.04"
-  case "$ver" in 22.04|24.04) ;; *) die "Ubuntu $ver no admitido: solo 22.04 y 24.04" ;; esac
+  # El codename sale solo de las versiones admitidas, nunca de datos del usuario.
+  case "$ver" in
+    22.04) OS_CODENAME=jammy ;;
+    24.04) OS_CODENAME=noble ;;
+    *) die "Ubuntu $ver no admitido: solo 22.04 y 24.04" ;;
+  esac
   case "$uname_m" in
     x86_64|amd64) NODE_ARCH=x64 ;;
     aarch64|arm64) NODE_ARCH=arm64 ;;
@@ -167,7 +180,8 @@ preflight() {
     for c in tar sha256sum mktemp; do need "$c"; done
     if ! selected base && { selected node || vendor_selected; }; then need curl; fi
     if selected base || selected docker; then need apt-get; fi
-    if selected base || selected docker || selected playwright; then
+    if selected tailscale; then ts_preflight; fi
+    if selected base || selected docker || selected playwright || { selected tailscale && ! ts_complete; }; then
       need sudo
       sudo -v || die "este usuario no puede usar sudo"
     fi
@@ -180,6 +194,39 @@ preflight() {
       die "$NODE_CUR ya existe pero su Node no es >=$NODE_MAJOR con npm: revísalo o elimina ese enlace a mano"
     fi
   fi
+}
+
+ts_cli_present() { have tailscale; }
+ts_daemon_present() { if have tailscaled; then return 0; fi; [ -x "$TS_SBIN_DAEMON" ]; }
+ts_complete() { ts_cli_present && ts_daemon_present; }
+
+# Solo con --apply, antes de cambiar nada.
+ts_preflight() {
+  if ts_complete; then return 0; fi
+  if ts_cli_present || ts_daemon_present; then
+    die "instalación parcial de Tailscale (solo existe uno de tailscale/tailscaled): no se reemplaza; revísala a mano"
+  fi
+  need apt-get
+  need sudo
+  if ! selected base; then
+    need curl
+    [ -r "$CA_BUNDLE" ] || die "falta ca-certificates ($CA_BUNDLE): instálalo o incluye el módulo base"
+  fi
+}
+
+# Estado de un destino frente al contenido esperado: absent | same | conflict (symlink, no regular o distinto).
+ts_target_state() { # destino origen
+  local t=$1 src=$2
+  if [ -L "$t" ]; then printf 'conflict'; return 0; fi
+  if [ ! -e "$t" ]; then printf 'absent'; return 0; fi
+  if [ -f "$t" ] && cmp -s "$t" "$src"; then printf 'same'; else printf 'conflict'; fi
+}
+
+ts_repo_line() { printf 'deb [signed-by=%s] %s %s main\n' "$TS_KEYRING" "$TS_BASE" "$OS_CODENAME"; }
+
+ts_list_content() {
+  printf '# Generado por %s: repositorio apt oficial de Tailscale\n' "$PROG"
+  ts_repo_line
 }
 
 cleanup() { if [ -n "$WORK" ] && [ -d "$WORK" ]; then rm -rf -- "$WORK"; fi; }
@@ -477,6 +524,48 @@ mod_remote() {
   have mosh || warn "mosh no está instalado: incluye el módulo base"
 }
 
+mod_tailscale() {
+  local key lst ks ls_ keyurl
+  log "== tailscale: paquete oficial desde el repositorio apt firmado (sin login) =="
+  if ts_complete; then
+    log "  tailscale y tailscaled ya están instalados: se omite sin tocar su configuración"
+    return 0
+  fi
+  if ts_cli_present || ts_daemon_present; then
+    die "instalación parcial de Tailscale (solo existe uno de tailscale/tailscaled): no se reemplaza; revísala a mano"
+  fi
+  case "$OS_CODENAME" in jammy|noble) ;; *) die "codename de Ubuntu no determinado o no admitido: '$OS_CODENAME'" ;; esac
+  keyurl="$TS_BASE/$OS_CODENAME.noarmor.gpg"
+  if [ "$APPLY" != 1 ]; then
+    log "[dry-run] descargar solo la clave $keyurl a un archivo temporal (debe ser no vacía)"
+    log "[dry-run] generar la lista con: $(ts_repo_line)"
+    log "[dry-run] sudo install -m0644 clave -> $TS_KEYRING y lista -> $TS_LIST (solo si no existen; si existen deben ser idénticos y no symlinks, o se aborta sin escribir ninguno)"
+    log "[dry-run] sudo apt-get update; sudo apt-get install -y tailscale"
+    log "[dry-run] sin autenticación ni claves de acceso a ninguna tailnet; el paquete puede arrancar el servicio tailscaled"
+    return 0
+  fi
+  key=$WORK/tailscale.gpg lst=$WORK/tailscale.list
+  fetch "$keyurl" "$key"
+  [ -s "$key" ] || die "descarga vacía: $keyurl"
+  ts_list_content > "$lst"
+  ks=$(ts_target_state "$TS_KEYRING" "$key")
+  ls_=$(ts_target_state "$TS_LIST" "$lst")
+  if [ "$ks" = conflict ] || [ "$ls_" = conflict ]; then
+    die "$TS_KEYRING ($ks) o $TS_LIST ($ls_) existen y difieren de lo esperado o son symlinks: no se modifica ninguno; revísalos a mano"
+  fi
+  if [ "$ks" = absent ]; then
+    run sudo install -d -m0755 "$(dirname "$TS_KEYRING")"
+    run sudo install -m0644 "$key" "$TS_KEYRING"
+  fi
+  if [ "$ls_" = absent ]; then
+    run sudo install -d -m0755 "$(dirname "$TS_LIST")"
+    run sudo install -m0644 "$lst" "$TS_LIST"
+  fi
+  run sudo env DEBIAN_FRONTEND=noninteractive apt-get update
+  run sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y tailscale
+  if ! ts_complete; then die "tras instalar, faltan tailscale o tailscaled"; fi
+}
+
 mod_playwright() {
   log "== playwright: @playwright/test y @playwright/cli en un workspace dedicado =="
   require_node playwright
@@ -518,6 +607,10 @@ summary() {
     log "Pi: ejecuta /reload en las sesiones abiertas y comprueba a mano con /selection-editor status."
   fi
   log "Logins manuales (no se hacen aquí): $logins"
+  if selected tailscale; then
+    log "Tailscale: no se ha autenticado ni unido a ninguna tailnet (el servicio tailscaled pudo arrancar al instalar el paquete)."
+    log "  Opcional y manual, con la aprobación del dueño de la tailnet: sudo tailscale up   (no se ejecuta aquí)"
+  fi
 }
 
 main() {
