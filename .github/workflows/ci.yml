@@ -23,7 +23,25 @@ jobs:
         run: |
           bash -n install.sh
           bash -n doctor.sh
+          bash -n tests/pi-integration.sh
       - name: ShellCheck
-        run: shellcheck install.sh doctor.sh
+        run: shellcheck install.sh doctor.sh tests/pi-integration.sh
       - name: Tests (comandos simulados, sin instalar nada)
         run: python3 -I -m unittest discover -s tests -v
+
+  pi-integration:
+    name: integración real de Pi (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Pi y pi-selection-editor reales en un HOME aislado (usa red)
+        run: bash tests/pi-integration.sh

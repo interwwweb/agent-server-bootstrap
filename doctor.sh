@@ -18,7 +18,9 @@ Uso: ./doctor.sh [opciones]
   --modules LISTA   Módulos a comprobar (no puede ir vacía; por defecto los mismos
                     que install.sh, sin docker).
                     Disponibles: base node python agents cloud remote playwright docker
-  --with-pi         Comprueba también el comando pi; requiere el módulo agents.
+  --with-pi         Comprueba también pi (versión >=0.87.1 <0.88.0) y la extensión
+                    pi-selection-editor (clon, commit fijado y enlace estable);
+                    requiere el módulo agents.
   --versions        Imprime las versiones instaladas (para guardar en un informe).
                     Un comando que existe pero no puede ejecutar --version se
                     informa como FALLO y cuenta como comprobación fallida.
@@ -66,6 +68,42 @@ check() { # comando [alternativa]
   printf 'FALTA    %s\n' "$1"; MISSING=$((MISSING + 1))
 }
 
+PI_EXT_COMMIT=93d60682e2aeca492d05c19ca3dbc3b46f360241
+PI_EXT_DIR="$ASB_HOME/extensions/pi-selection-editor"
+
+fail() { printf 'FALLO    %s\n' "$*"; MISSING=$((MISSING + 1)); }
+
+# Pi estable 0.87.N con N>=1 (compatible con pi-selection-editor: >=0.87.1 <0.88.0).
+check_pi_version() {
+  local out rc=0 v patch=""
+  out=$(pi --version 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ]; then fail "pi --version terminó con código $rc"; return 0; fi
+  v=${out%%$'\n'*}; v=${v##* }; v=${v#v}
+  case "$v" in 0.87.*) patch=${v#0.87.} ;; esac
+  case "$patch" in
+    ''|*[!0-9]*) fail "pi $v no es compatible con pi-selection-editor (se requiere >=0.87.1 <0.88.0)" ;;
+    *) if [ "$patch" -ge 1 ]; then printf 'ok       pi %s compatible (>=0.87.1 <0.88.0)\n' "$v"
+       else fail "pi $v no es compatible con pi-selection-editor (se requiere >=0.87.1 <0.88.0)"; fi ;;
+  esac
+}
+
+# Solo sistema de archivos y git en lectura: no comprueba el registro en Pi ni el editor en ejecución.
+check_pi_extension() {
+  local head stable
+  if [ ! -d "$PI_EXT_DIR" ]; then fail "extensión pi-selection-editor no encontrada en $PI_EXT_DIR"; return 0; fi
+  if ! have git; then fail "no se puede comprobar el commit de la extensión: falta git"; return 0; fi
+  head=$(git -C "$PI_EXT_DIR" rev-parse HEAD 2>/dev/null) || head=""
+  if [ "$head" = "$PI_EXT_COMMIT" ]; then printf 'ok       extensión pi-selection-editor en %s (%s)\n' "$PI_EXT_DIR" "$head"
+  else fail "extensión en $PI_EXT_DIR está en '${head:-desconocido}' (se esperaba $PI_EXT_COMMIT)"; fi
+  stable=${PI_SELECTION_EDITOR_DIR:-$HOME/.local/share/pi-selection-editor}
+  if [ -d "$stable" ] && [ "$(cd "$stable" && pwd -P)" = "$(cd "$PI_EXT_DIR" && pwd -P)" ]; then
+    printf 'ok       enlace estable %s\n' "$stable"
+  else
+    fail "el enlace estable $stable no apunta a $PI_EXT_DIR"
+  fi
+  echo "nota     comprueba a mano en Pi: /reload y /selection-editor status (doctor no lo verifica)"
+}
+
 selected base && for c in git curl wget jq rg fzf unzip zip gcc pkg-config python3 tmux mosh gh; do check "$c"; done
 selected base && check fd fdfind
 if selected node; then
@@ -79,7 +117,7 @@ if selected node; then
   fi
 fi
 selected python && check uv
-if selected agents; then check codex; check claude; check herdr; if [ "$WITH_PI" = 1 ]; then check pi; fi; fi
+if selected agents; then check codex; check claude; check herdr; if [ "$WITH_PI" = 1 ]; then check pi; if have pi; then check_pi_version; fi; check_pi_extension; fi; fi
 selected cloud && for c in vercel sanity supabase; do check "$c"; done
 selected remote && { check moshi-hook; check mosh; }
 selected playwright && { check playwright; check playwright-cli; }

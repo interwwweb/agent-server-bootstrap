@@ -10,12 +10,19 @@ NODE_MAJOR=24
 NODE_DIST="https://nodejs.org/dist/latest-v${NODE_MAJOR}.x"
 APT_BASE_PKGS=(git curl wget ca-certificates jq ripgrep fd-find fzf unzip zip build-essential pkg-config python3 python3-venv python3-pip tmux mosh gh)
 APT_DOCKER_PKGS=(docker.io docker-compose-v2)
+# Pi fijado (excepción a «latest») por compatibilidad con pi-selection-editor (Pi >=0.87.1 <0.88.0).
+PI_PKG="@earendil-works/pi-coding-agent"
+PI_VERSION=0.87.1
+PI_EXT_URL="https://github.com/interwwweb/pi-selection-editor.git"
+PI_EXT_TAG=v0.1.2
+PI_EXT_COMMIT=93d60682e2aeca492d05c19ca3dbc3b46f360241
 
 ASB_HOME="$HOME/.local/share/$PROG"
 LOCAL_BIN="$HOME/.local/bin"
 NODE_ROOT="$ASB_HOME/node"
 NODE_CUR="$NODE_ROOT/current"
 TOOLS="$ASB_HOME/tools"
+PI_EXT_DIR="$ASB_HOME/extensions/pi-selection-editor"
 ENV_FILE="$ASB_HOME/env.sh"
 PROFILE_BEGIN="# >>> $PROG >>>"
 PROFILE_END="# <<< $PROG <<<"
@@ -54,7 +61,9 @@ Opciones:
                           base,node,python,agents,cloud,remote,playwright
                           Disponibles: base node python agents cloud remote playwright docker
   --with-docker           Añade el módulo docker (opcional).
-  --with-pi               Instala también Pi (@earendil-works/pi-coding-agent); requiere agents.
+  --with-pi               Instala también Pi fijado en 0.87.1 (si falta; uno existente debe ser
+                          0.87.x con x>=1) y la extensión pi-selection-editor v0.1.2 (commit
+                          fijado, con su instalador upstream). Requiere agents.
   --vendor-installers     Autoriza los scripts de terceros que se descargan y ejecutan:
                           uv (python), Claude Code y Herdr (agents), moshi-hook (remote).
                           Obligatorio con --apply si se elige python, agents o remote.
@@ -162,6 +171,7 @@ preflight() {
       need sudo
       sudo -v || die "este usuario no puede usar sudo"
     fi
+    if [ "$WITH_PI" = 1 ]; then pi_preflight; fi
     # Dependencias comprobadas antes de cambiar nada.
     if needs_npm && ! selected node && ! node_ok; then
       die "los módulos agents/cloud/playwright necesitan Node>=$NODE_MAJOR y npm (hay: $(node_desc)): incluye el módulo node"
@@ -213,6 +223,102 @@ npm_global() { # binario paquete [flags...]
   if have "$bin"; then log "  $pkg: '$bin' ya existe, se omite"; return 0; fi
   if [ "$APPLY" = 1 ]; then need npm; check_npm_prefix; fi
   run npm install -g --no-audit --no-fund "$@" "$pkg"
+}
+
+# Versión de Pi: última palabra de la primera línea de `pi --version`, sin «v» inicial.
+pi_version() {
+  local out
+  out=$(pi --version 2>&1) || return 1
+  out=${out%%$'\n'*}; out=${out##* }
+  printf '%s' "${out#v}"
+}
+
+# Pi estable 0.87.N con N>=1 (compatible con pi-selection-editor: >=0.87.1 <0.88.0).
+pi_version_ok() {
+  local patch
+  case "$1" in 0.87.*) ;; *) return 1 ;; esac
+  patch=${1#0.87.}
+  case "$patch" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$patch" -ge 1 ]
+}
+
+pi_check_version() {
+  local v
+  v=$(pi_version) || die "no se pudo ejecutar 'pi --version': no se reemplaza ni se toca el Pi existente"
+  pi_version_ok "$v" || die "Pi $v no es compatible con pi-selection-editor (se requiere >=0.87.1 <0.88.0 estable); no se reemplaza ni se baja de versión"
+}
+
+# Comprueba un clon existente de la extensión: origin exacto, commit fijado, worktree limpio.
+ext_verify() { # directorio
+  local d=$1 origin head dirty
+  if [ -L "$d" ] || [ ! -d "$d" ]; then die "$d existe y no es un directorio real: no se modifica"; fi
+  origin=$(git -C "$d" remote get-url origin 2>/dev/null) || die "$d no es un clon de $PI_EXT_URL: no se modifica"
+  [ "$origin" = "$PI_EXT_URL" ] || die "$d tiene origin $origin (se esperaba $PI_EXT_URL): no se modifica"
+  head=$(git -C "$d" rev-parse HEAD 2>/dev/null) || die "no se pudo leer el commit de $d: no se modifica"
+  [ "$head" = "$PI_EXT_COMMIT" ] || die "$d está en $head (se esperaba $PI_EXT_COMMIT): no se modifica"
+  dirty=$(git -C "$d" status --porcelain --untracked-files=all 2>/dev/null) || die "no se pudo comprobar el estado de $d: no se modifica"
+  [ -z "$dirty" ] || die "$d tiene cambios locales o archivos sin seguimiento: no se modifica"
+  [ -f "$d/scripts/install.sh" ] || die "falta $d/scripts/install.sh"
+}
+
+# Solo con --apply, antes de cualquier cambio.
+pi_preflight() {
+  if [ -e "$PI_EXT_DIR" ] || [ -L "$PI_EXT_DIR" ]; then
+    need git
+    ext_verify "$PI_EXT_DIR"
+  elif ! selected base; then
+    need git
+  fi
+  need bash
+  if have pi; then pi_check_version; fi
+}
+
+pi_install() {
+  log "  Pi: fijado en $PI_PKG@$PI_VERSION (excepción a «latest»); uno existente debe ser 0.87.x con x>=1 y no se reemplaza"
+  npm_global pi "$PI_PKG@$PI_VERSION" --ignore-scripts
+  if [ "$APPLY" = 1 ]; then
+    have pi || die "pi no quedó disponible tras instalar $PI_PKG@$PI_VERSION"
+    pi_check_version
+  fi
+}
+
+ext_clone() {
+  local parent tmp
+  parent=$(dirname "$PI_EXT_DIR")
+  mkdir -p "$parent"
+  tmp=$(mktemp -d "$parent/.tmp.XXXXXX")
+  log "+ git clone --branch $PI_EXT_TAG --depth 1 $PI_EXT_URL"
+  if ! git clone --quiet --branch "$PI_EXT_TAG" --depth 1 "$PI_EXT_URL" "$tmp/repo"; then
+    rm -rf -- "$tmp"; die "falló git clone de $PI_EXT_URL ($PI_EXT_TAG)"
+  fi
+  if ! ( ext_verify "$tmp/repo" ); then
+    rm -rf -- "$tmp"; die "el clon descargado no coincide con el commit fijado $PI_EXT_COMMIT: no se instala"
+  fi
+  if [ -e "$PI_EXT_DIR" ] || [ -L "$PI_EXT_DIR" ]; then
+    rm -rf -- "$tmp"; die "$PI_EXT_DIR apareció durante la clonación: no se sobrescribe"
+  fi
+  mv "$tmp/repo" "$PI_EXT_DIR"
+  rmdir "$tmp"
+}
+
+# Extensión pi-selection-editor: clon fijado + instalador upstream (pi install). No edita JSON de Pi.
+configure_pi() {
+  log "== pi-selection-editor $PI_EXT_TAG =="
+  if [ "$APPLY" != 1 ]; then
+    log "[dry-run] git clone --branch $PI_EXT_TAG --depth 1 $PI_EXT_URL a un directorio temporal junto a $PI_EXT_DIR"
+    log "[dry-run] verificar git rev-parse HEAD = $PI_EXT_COMMIT y renombrar solo si $PI_EXT_DIR no existe"
+    log "[dry-run] si $PI_EXT_DIR existe: exigir origin $PI_EXT_URL, ese commit y worktree limpio (con untracked); si no, falla sin tocarlo"
+    log "[dry-run] bash $PI_EXT_DIR/scripts/install.sh (instalador upstream: pi install; respeta PI_CODING_AGENT_DIR)"
+    return 0
+  fi
+  if [ -e "$PI_EXT_DIR" ] || [ -L "$PI_EXT_DIR" ]; then
+    ext_verify "$PI_EXT_DIR"
+    log "  $PI_EXT_DIR ya existe y coincide con el commit fijado; se reutiliza"
+  else
+    ext_clone
+  fi
+  # El instalador upstream es idempotente y hereda PI_CODING_AGENT_DIR / PI_SELECTION_EDITOR_DIR del entorno.
+  run bash "$PI_EXT_DIR/scripts/install.sh"
 }
 
 npm_workspace() { # directorio paquetes...
@@ -347,7 +453,7 @@ mod_agents() {
   require_node agents
   npm_global codex @openai/codex
   download_run "Claude Code" claude https://claude.ai/install.sh bash stable
-  if [ "$WITH_PI" = 1 ]; then npm_global pi @earendil-works/pi-coding-agent --ignore-scripts; fi
+  if [ "$WITH_PI" = 1 ]; then pi_install; configure_pi; fi
   download_run Herdr herdr https://herdr.dev/install.sh sh
 }
 
@@ -408,6 +514,9 @@ summary() {
   if [ "$APPLY" != 1 ]; then log "Dry-run terminado. Para aplicar: ./install.sh --apply --yes [--vendor-installers]"; return 0; fi
   if [ "$WITH_PI" = 1 ]; then logins="$logins, pi → /login"; fi
   log "Listo. Abre una sesión nueva (o ejecuta: . ~/.profile) y comprueba con ./doctor.sh"
+  if [ "$WITH_PI" = 1 ]; then
+    log "Pi: ejecuta /reload en las sesiones abiertas y comprueba a mano con /selection-editor status."
+  fi
   log "Logins manuales (no se hacen aquí): $logins"
 }
 

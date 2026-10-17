@@ -16,6 +16,12 @@ BASH = shutil.which("bash")
 FORBIDDEN = ["curl", "wget", "sudo", "apt-get", "npm", "git", "sh"]
 
 
+EXT_COMMIT = "93d60682e2aeca492d05c19ca3dbc3b46f360241"
+EXT_URL = "https://github.com/interwwweb/pi-selection-editor.git"
+# Oculta pi hasta que un npm simulado cree FAKEBIN/pi (sin depender de lo que haya en el sistema).
+PI_HIDE = 'have() { if [ "$1" = pi ] && [ ! -x "$FAKEBIN/pi" ]; then return 1; fi; command -v "$1" >/dev/null 2>&1; }'
+
+
 def hide(*names):
     """Código bash que redefine `have` para ocultar comandos concretos y delega el resto."""
     cond = " || ".join(f'[ "$1" = {n} ]' for n in names)
@@ -177,6 +183,19 @@ class DryRunTests(Base):
         self.assertIn("npm install -g --no-audit --no-fund pnpm", r.stdout)
         self.assert_untouched()
 
+    def test_with_pi_dry_run_plans_pinned_pi_then_extension(self):
+        r = self.run_install("--with-pi")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = r.stdout
+        for text in ("@earendil-works/pi-coding-agent@0.87.1", "--ignore-scripts", "v0.1.2",
+                     EXT_COMMIT, EXT_URL, "scripts/install.sh", "PI_CODING_AGENT_DIR"):
+            self.assertIn(text, out)
+        self.assertLess(out.index("pi-coding-agent@0.87.1"), out.index("== pi-selection-editor"))
+        self.assert_untouched()
+
+    def test_without_pi_flag_no_extension_in_plan(self):
+        self.assertNotIn("pi-selection-editor", self.run_install().stdout)
+
     def test_pi_only_appears_with_flag(self):
         self.assertNotIn("pi-coding-agent", self.run_install().stdout)
         self.assertNotIn("pi →", self.run_install().stdout)
@@ -296,6 +315,179 @@ fi
         r = self.sh(f'{hide("node", "npm")}; APPLY=0; SELECTED="agents"; require_node agents')
         self.assertEqual(r.returncode, 0)
         self.assertIn("AVISO", r.stderr)
+
+    # --- Pi fijado + extensión pi-selection-editor -------------------------------------------
+
+    def ext_dir(self):
+        return self.home / ".local/share/agent-server-bootstrap/extensions/pi-selection-editor"
+
+    def make_ext(self):
+        d = self.ext_dir()
+        (d / "scripts").mkdir(parents=True)
+        (d / "scripts/install.sh").write_text("#!/bin/sh\n")
+        (d / "marker").write_text("no tocar\n")
+        return d
+
+    def fake_git(self):
+        self.fake("git", f'''echo "git $*" >> "$MOCK_LOG"
+if [ "$1" = -C ]; then shift 2; fi
+case "$1" in
+  clone)
+    [ -z "$FAKE_CLONE_FAIL" ] || exit 1
+    for a; do dest=$a; done
+    mkdir -p "$dest/scripts"
+    printf '#!/bin/sh\\n' > "$dest/scripts/install.sh" ;;
+  rev-parse) echo "${{FAKE_HEAD:-{EXT_COMMIT}}}" ;;
+  remote) echo "${{FAKE_ORIGIN:-{EXT_URL}}}" ;;
+  status) printf '%s' "$FAKE_STATUS" ;;
+esac
+''')
+
+    def fake_bash_logger(self):
+        self.fake("bash", 'echo "bash $* PI_CODING_AGENT_DIR=$PI_CODING_AGENT_DIR" >> "$MOCK_LOG"\n')
+
+    def fake_pi(self, version):
+        self.fake("pi", f'echo "{version}"\n')
+
+    def fake_agents_env(self):
+        self.fake_node(24)
+        self.fake("npm", '''echo "npm $*" >> "$MOCK_LOG"
+if [ "$1" = prefix ]; then echo "$HOME/.local"; fi
+case "$*" in *pi-coding-agent*) printf '#!/bin/sh\\necho 0.87.1\\n' > "$FAKEBIN/pi"; chmod 755 "$FAKEBIN/pi" ;; esac
+''')
+        for name in ("codex", "claude", "herdr"):
+            self.fake(name, "")
+
+    def call_index(self, fragment):
+        return next(i for i, c in enumerate(self.calls()) if fragment in c)
+
+    def test_with_pi_installs_pinned_pi_then_extension_then_upstream_installer(self):
+        self.fake_agents_env()
+        self.fake_git()
+        self.fake_bash_logger()
+        r = self.sh(f'{PI_HIDE}; SELECTED="agents"; WITH_PI=1; mod_agents', FAKEBIN=str(self.bin))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        pi_i = self.call_index("pi-coding-agent@0.87.1")
+        self.assertIn("--ignore-scripts", self.calls()[pi_i])
+        clone_i = self.call_index("clone")
+        run_i = self.call_index(f"bash {self.ext_dir()}/scripts/install.sh")
+        self.assertLess(pi_i, clone_i)
+        self.assertLess(clone_i, run_i)
+        self.assertIn(f"--branch v0.1.2 --depth 1 {EXT_URL}", self.calls()[clone_i])
+        self.assertEqual([p.name for p in self.ext_dir().parent.iterdir()], ["pi-selection-editor"])
+
+    def test_without_with_pi_mod_agents_ignores_pi_and_extension(self):
+        self.fake_agents_env()
+        self.fake_git()
+        self.fake_bash_logger()
+        r = self.sh('SELECTED="agents"; WITH_PI=0; mod_agents', FAKEBIN=str(self.bin))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_existing_compatible_pi_is_kept_but_extension_still_installed(self):
+        self.fake_agents_env()
+        self.fake_git()
+        self.fake_bash_logger()
+        self.fake_pi("0.87.2")
+        r = self.sh('SELECTED="agents"; WITH_PI=1; mod_agents', FAKEBIN=str(self.bin))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(any("pi-coding-agent" in c for c in self.calls()))
+        self.call_index(f"bash {self.ext_dir()}/scripts/install.sh")
+
+    def test_existing_incompatible_pi_fails_without_installing_anything(self):
+        self.fake_agents_env()
+        self.fake_git()
+        self.fake_bash_logger()
+        self.fake_pi("0.87.0")
+        r = self.sh('SELECTED="agents"; WITH_PI=1; mod_agents', FAKEBIN=str(self.bin))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no es compatible", r.stderr)
+        self.assertEqual([c for c in self.calls() if c.startswith(("npm install", "git clone", "bash"))], [])
+        self.assertFalse(self.ext_dir().exists())
+
+    def test_pi_preflight_version_matrix_touches_nothing(self):
+        self.fake_git()
+        for version, ok in (("0.87.1", True), ("v0.87.5", True), ("pi 0.87.2", True), ("0.87.10", True),
+                            ("0.87.0", False), ("0.88.0", False), ("0.86.9", False),
+                            ("0.87.2-beta.1", False), ("0.87.", False), ("garbage", False)):
+            with self.subTest(version=version):
+                self.fake_pi(version)
+                r = self.sh('SELECTED="base agents"; pi_preflight')
+                self.assertEqual(r.returncode, 0 if ok else 1, r.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(list(self.home.rglob("*")), [])
+
+    def test_pi_preflight_needs_git_unless_base_selected(self):
+        r = self.sh(f'{hide("git", "pi")}; SELECTED="agents"; pi_preflight')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("git", r.stderr)
+        r = self.sh(f'{hide("git", "pi")}; SELECTED="base agents"; pi_preflight')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.make_ext()
+        r = self.sh(f'{hide("git", "pi")}; SELECTED="base agents"; pi_preflight')
+        self.assertEqual(r.returncode, 1)
+
+    def test_pi_preflight_rejects_bad_existing_extension(self):
+        self.make_ext()
+        self.fake_git()
+        self.assertEqual(self.sh(f'{hide("pi")}; SELECTED="agents"; pi_preflight').returncode, 0)
+        r = self.sh(f'{hide("pi")}; SELECTED="agents"; pi_preflight', FAKE_HEAD="deadbeef")
+        self.assertEqual(r.returncode, 1)
+
+    def test_existing_verified_clone_is_reused_and_installer_runs_each_time(self):
+        d = self.make_ext()
+        self.fake_git()
+        self.fake_bash_logger()
+        r = self.sh("configure_pi; configure_pi")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(any("clone" in c for c in self.calls()))
+        self.assertEqual(len([c for c in self.calls() if c.startswith("bash ")]), 2)
+        self.assertTrue((d / "marker").exists())
+
+    def test_wrong_origin_commit_dirty_or_symlink_prevent_installer(self):
+        d = self.make_ext()
+        self.fake_git()
+        self.fake_bash_logger()
+        for extra in ({"FAKE_HEAD": "deadbeef"},
+                      {"FAKE_ORIGIN": "https://github.com/otro/pi-selection-editor.git"},
+                      {"FAKE_STATUS": "?? nuevo.txt\n"}):
+            with self.subTest(**extra):
+                r = self.sh("configure_pi", **extra)
+                self.assertEqual(r.returncode, 1)
+                self.assertIn("no se modifica", r.stderr)
+        self.assertEqual([c for c in self.calls() if c.startswith(("bash ", "git clone"))], [])
+        self.assertEqual((d / "marker").read_text(), "no tocar\n")
+        other = self.tmp / "otro"
+        other.mkdir()
+        shutil.rmtree(d)
+        d.symlink_to(other)
+        self.assertEqual(self.sh("configure_pi").returncode, 1)
+        self.assertEqual([c for c in self.calls() if c.startswith("bash ")], [])
+
+    def test_failed_or_mismatched_clone_leaves_no_durable_dir(self):
+        self.fake_git()
+        self.fake_bash_logger()
+        for extra in ({"FAKE_CLONE_FAIL": "1"}, {"FAKE_HEAD": "deadbeef"}):
+            with self.subTest(**extra):
+                r = self.sh("configure_pi", **extra)
+                self.assertEqual(r.returncode, 1)
+                self.assertFalse(self.ext_dir().exists())
+                parent = self.ext_dir().parent
+                self.assertEqual(list(parent.iterdir()) if parent.exists() else [], [])
+        self.assertEqual([c for c in self.calls() if c.startswith("bash ")], [])
+
+    def test_installer_inherits_runtime_env_and_settings_are_not_touched(self):
+        self.fake_git()
+        self.fake_bash_logger()
+        agent_dir = self.tmp / "agentdir"
+        agent_dir.mkdir()
+        settings = agent_dir / "settings.json"
+        settings.write_text('{"mio": true}\n')
+        r = self.sh("configure_pi", PI_CODING_AGENT_DIR=str(agent_dir))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"PI_CODING_AGENT_DIR={agent_dir}", self.calls()[self.call_index("bash ")])
+        self.assertEqual(settings.read_text(), '{"mio": true}\n')
+        self.assertEqual(sorted(p.name for p in agent_dir.iterdir()), ["settings.json"])
 
     def test_mod_node_installs_pnpm_with_npm_global_after_node(self):
         self.fake_node(24)
@@ -478,6 +670,54 @@ class DoctorTests(Base):
             [BASH, str(DOCTOR), *args], env=self.env(**extra), cwd=self.tmp,
             capture_output=True, text=True, timeout=60,
         )
+
+    def pi_env(self, version="0.87.1", head=EXT_COMMIT, ext=True, link=True):
+        """PATH con pi y git simulados, y (opcionalmente) extensión y enlace estable en HOME."""
+        d = self.tmp / "pibin"
+        d.mkdir(exist_ok=True)
+        for name, body in (("pi", f'echo "{version}"\n'), ("git", f'echo "{head}"\n')):
+            p = d / name
+            p.write_text("#!/bin/sh\n" + body)
+            p.chmod(0o755)
+        extdir = self.home / ".local/share/agent-server-bootstrap/extensions/pi-selection-editor"
+        if ext:
+            extdir.mkdir(parents=True)
+            if link:
+                stable = self.home / ".local/share/pi-selection-editor"
+                stable.symlink_to(extdir)
+        return f"{d}:{self.mock}:/usr/bin:/bin"
+
+    def run_pi_doctor(self, **kw):
+        return self.run_doctor("--modules", "agents", "--with-pi", path=self.pi_env(**kw))
+
+    def test_with_pi_checks_version_extension_commit_and_stable_link(self):
+        r = self.run_pi_doctor()
+        self.assertRegex(r.stdout, r"ok\s+pi \(")
+        self.assertRegex(r.stdout, r"ok\s+pi 0\.87\.1 compatible")
+        self.assertRegex(r.stdout, r"ok\s+extensión pi-selection-editor")
+        self.assertIn(EXT_COMMIT, r.stdout)
+        self.assertRegex(r.stdout, r"ok\s+enlace estable")
+        self.assertIn("/selection-editor status", r.stdout)
+        self.assertNotRegex(r.stdout, r"FALLO\s+(pi|extensión|el enlace)")
+
+    def test_with_pi_reports_incompatible_pi_wrong_commit_and_missing_pieces(self):
+        for kw, pattern in (
+            ({"version": "0.87.0"}, r"FALLO\s+pi 0\.87\.0 no es compatible"),
+            ({"version": "0.88.1"}, r"FALLO\s+pi 0\.88\.1 no es compatible"),
+            ({"head": "deadbeef"}, r"FALLO\s+extensión .*deadbeef"),
+            ({"link": False}, r"FALLO\s+el enlace estable"),
+            ({"ext": False}, r"FALLO\s+extensión pi-selection-editor no encontrada"),
+        ):
+            with self.subTest(**kw):
+                shutil.rmtree(self.home, ignore_errors=True)
+                self.home.mkdir()
+                r = self.run_pi_doctor(**kw)
+                self.assertEqual(r.returncode, 1)
+                self.assertRegex(r.stdout, pattern)
+
+    def test_without_with_pi_no_extension_checks(self):
+        r = self.run_doctor("--modules", "agents")
+        self.assertNotIn("pi-selection-editor", r.stdout)
 
     def test_empty_modules_rejected(self):
         for value in ("", ",", " , "):

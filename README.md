@@ -71,7 +71,12 @@ Detalles de diseño:
 - **Supabase**: se instala en `~/.local/share/agent-server-bootstrap/tools/supabase` y el wrapper `~/.local/bin/supabase` ejecuta el binario por ruta absoluta (no se descarga «latest» en cada invocación).
 - **Playwright**: `install --with-deps chromium` se ejecuta en dos pasos equivalentes: `sudo … install-deps chromium` (apt) y `install chromium` como usuario, para que el navegador quede en tu HOME y no en el de root. Solo ocurre con `--apply`.
 - **Scripts de terceros** (Claude, uv, Herdr, moshi-hook): se descargan a un archivo temporal y se ejecutan (no `curl | sh`). Todos exigen `--vendor-installers` con `--apply`: uv (`python`), Claude Code y Herdr (`agents`) y moshi-hook (`remote`). Herdr y moshi-hook no están auditados: ver [SECURITY.md](SECURITY.md).
-- **Pi** (`--with-pi`, opcional): `@earendil-works/pi-coding-agent` con `--ignore-scripts`. El 17/10/2026 se comprobó que `badlogic/pi-mono` redirige a `earendil-works/pi`, cuyo README indica ese paquete npm y Node ≥ 22.19. Se asume que es el Pi que quieres usar; esa decisión es tuya.
+- **Pi** (`--with-pi`, opcional): `@earendil-works/pi-coding-agent@0.87.1` con `--ignore-scripts`, **fijado** (excepción a «latest») por compatibilidad con la extensión. El 17/10/2026 se comprobó que `badlogic/pi-mono` redirige a `earendil-works/pi`, cuyo README indica ese paquete npm y Node ≥ 22.19. Se asume que es el Pi que quieres usar; esa decisión es tuya.
+  - Solo se instala si `pi` falta. Si ya existe, debe ser estable `0.87.x` con x ≥ 1 (compatible: `>=0.87.1 <0.88.0`); si no, `--apply` aborta en la comprobación previa, antes de cambiar nada, y nunca baja ni reemplaza Pi. Con `--with-pi` hace falta `git` (si no incluyes `base`).
+  - **Extensión [pi-selection-editor](https://github.com/interwwweb/pi-selection-editor)** `v0.1.2`, commit fijado `93d60682e2aeca492d05c19ca3dbc3b46f360241`: se clona (`--branch v0.1.2 --depth 1`) en un directorio temporal junto a `~/.local/share/agent-server-bootstrap/extensions/pi-selection-editor`, se verifica `git rev-parse HEAD` y solo entonces se renombra (si el destino no existe). Si el destino ya existe, debe tener `origin` exacto, ese commit y worktree limpio (también sin archivos sin seguimiento); si no, falla y no lo toca.
+  - Después ejecuta con `bash` el `scripts/install.sh` de la extensión (tras verificarla; lo cubre `--vendor-installers` del módulo `agents`). Ese instalador upstream rechaza Pi 0.87.0 o no 0.87.x, crea el enlace `~/.local/share/pi-selection-editor` (o `$PI_SELECTION_EDITOR_DIR`) y ejecuta `pi install`; respeta `PI_CODING_AGENT_DIR`. Se ejecuta en cada `--apply`, aunque Pi ya exista (es idempotente según upstream; no verificado en un equipo real). Este repositorio no edita JSON de Pi.
+  - Ciclo de vida: tras instalar, ejecuta `/reload` en las sesiones de Pi abiertas y comprueba a mano `/selection-editor status`; `doctor.sh` no verifica el editor en ejecución. Si lanzas Pi con `--no-extensions`, hay que pasar la ruta explícitamente con `--extension`; el script no reescribe lanzadores.
+  - El mapeo de teclas de Ghostty en Mac es manual y no se cambia aquí.
 - **`gh`** y `docker-compose-v2` vienen de apt: la versión puede ser antigua (p. ej. `gh` 2.4 en 22.04). Para la última, usa el repositorio de GitHub CLI por tu cuenta.
 
 ## Después de instalar: logins manuales
@@ -103,16 +108,17 @@ Probado (en local, con comandos simulados; ver `tests/`):
 - Rechazo de sistemas que no sean Ubuntu 22.04/24.04, de arquitecturas no admitidas y de root.
 - Bloque de `~/.profile` idempotente; no sobrescribir el archivo de entorno ni binarios/wrappers existentes.
 - Funciones del instalador cargadas con `source` y comandos simulados: rechazo de Node < 24 o sin npm (también sin el módulo `node`), workspaces npm y wrappers idempotentes, `apt-get update` antes de instalar Docker, rechazo de `--apply` sin `--vendor-installers` para `python`/`agents`/`remote`, y fallo temprano si `current` apunta a otro Node.
-- `doctor.sh`: sin expansión de globs, `--modules` vacío rechazado, `--with-pi` exige `agents`, y `--versions` informa como fallo un ejecutable cuyo `--version` falla.
+- `doctor.sh`: sin expansión de globs, `--modules` vacío rechazado, `--with-pi` exige `agents` (y comprueba versión de Pi, clon y commit de la extensión y enlace estable), y `--versions` informa como fallo un ejecutable cuyo `--version` falla.
+- Pi y extensión (con `git`, `pi`, `npm` y `bash` simulados): orden Pi → clon → instalador upstream, Pi incompatible aborta sin instalar, clon existente verificado se reutiliza, origin/commit/sucio/symlink impiden el instalador, clon fallido sin directorio roto, `PI_CODING_AGENT_DIR` heredado y settings intactos. La instalación real de Pi y su extensión se verifica por separado en el job de integración de CI.
 
-**No probado**: ninguna instalación real (`--apply`), ni en Ubuntu 22.04/24.04, ni en amd64/arm64, ni en un VPS. Tampoco `doctor.sh --smoke`, la descarga de Node/uv/Claude/Herdr/moshi-hook, la compatibilidad de los paquetes npm en cada arquitectura ni que Chromium arranque (p. ej. con las restricciones de usuario sin privilegios de Ubuntu 24.04). El CI no instala nada: solo `bash -n`, ShellCheck y los tests, en Ubuntu 24.04 y 22.04.
+**No probado**: ninguna instalación real (`--apply`), ni en Ubuntu 22.04/24.04, ni en amd64/arm64, ni en un VPS. Tampoco `doctor.sh --smoke`, la descarga de Node/uv/Claude/Herdr/moshi-hook, la compatibilidad de los paquetes npm en cada arquitectura ni que Chromium arranque (p. ej. con las restricciones de usuario sin privilegios de Ubuntu 24.04). El CI tiene dos trabajos en Ubuntu 24.04 y 22.04: lint y tests con comandos simulados (`bash -n`, ShellCheck, unittest), y una **integración real solo de Pi** (`tests/pi-integration.sh`). Esta última usa red, npm y git reales en un runner efímero con `HOME` temporal propio y `PI_CODING_AGENT_DIR=$HOME/custom-pi-agent`: carga `install.sh` y ejecuta solo `pi_install` y `configure_pi` (Pi 0.87.1, clon fijado, enlace estable, registro en los settings sin duplicados en una segunda pasada y `npm test` de la extensión). **No es** el bootstrap completo de Ubuntu: no ejecuta `main`, `base`, sudo, otros instaladores, ni logins, y sigue sin probarse un VPS completo, Chromium ni el terminal interactivo. Hasta que ese CI pase, no hay prueba de que funcione.
 
-> Verificación local del 17/10/2026 (macOS): sintaxis Bash y ShellCheck correctos; **49 tests con comandos simulados aprobados**. Esto no acredita una instalación real en Ubuntu. Para repetir:
+> Verificación local del 17/10/2026 (macOS): sintaxis Bash y ShellCheck correctos; **65 pruebas con comandos simulados aprobadas**. La integración real de Pi se ejecuta aparte en CI; esto no acredita el bootstrap completo de un VPS. Para repetir:
 > `bash -n install.sh doctor.sh && shellcheck install.sh doctor.sh && python3 -I -m unittest discover -s tests -v`.
 
 ## Versiones y reproducibilidad
 
-Todas las dependencias se instalan en «latest» (Node v24 más reciente, paquetes npm sin fijar, instaladores de terceros en su estado actual). **No se garantiza reproducibilidad.** Para dejar constancia de lo que se instaló:
+Las dependencias se instalan en «latest» salvo Pi y su extensión, fijados con `--with-pi` (Pi 0.87.1, pi-selection-editor v0.1.2 en un commit concreto). Node v24 más reciente, paquetes npm sin fijar, instaladores de terceros en su estado actual). **No se garantiza reproducibilidad.** Para dejar constancia de lo que se instaló:
 
 ```bash
 ./doctor.sh --versions > informe-versiones-$(date +%F).txt
@@ -145,6 +151,6 @@ Comprobadas en los sitios oficiales el 17/10/2026 (por quien coordina el proyect
 install.sh          instalador (dry-run por defecto)
 doctor.sh           comprobación de comandos, versiones y smoke test
 tests/              tests unittest con comandos simulados
-.github/workflows/  CI de solo lectura (lint y tests, sin instalar)
+.github/workflows/  CI de solo lectura (lint, tests simulados e integración real de Pi)
 SECURITY.md         cadena de suministro y permisos de agentes
 ```
