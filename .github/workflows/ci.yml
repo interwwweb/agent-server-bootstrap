@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: lint y tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Sintaxis bash
+        run: |
+          bash -n install.sh
+          bash -n doctor.sh
+      - name: ShellCheck
+        run: shellcheck install.sh doctor.sh
+      - name: Tests (comandos simulados, sin instalar nada)
+        run: python3 -I -m unittest discover -s tests -v
