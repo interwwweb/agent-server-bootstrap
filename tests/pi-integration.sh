@@ -41,14 +41,46 @@ stable="$HOME/.local/share/pi-selection-editor"
 # Python tolerante: `packages` puede contener cadenas u objetos con «source». Imprime los paquetes.
 packages_json() {
   python3 -I - "$settings" "$PI_EXT_DIR" "$stable" <<'PY'
-import json, sys
+import json, os, sys
+from pathlib import Path
+
 settings, ext, stable = sys.argv[1:4]
+base = Path(settings).parent
+targets = {Path(ext).resolve(), Path(stable).resolve()}
+
+
+def local_path(entry):
+    """Ruta local de un paquete (cadena u objeto con «source»); None si no es una ruta local.
+    Las rutas relativas se resuelven contra el directorio de settings, no contra el cwd."""
+    source = entry.get("source") if isinstance(entry, dict) else entry
+    if not isinstance(source, str) or "://" in source or source.startswith(("npm:", "git:", "git@", "github:")):
+        return None
+    path = Path(source).expanduser()
+    if not path.is_absolute():
+        path = base / path
+    return path.resolve()
+
+
+def is_ext(entry):
+    return local_path(entry) in targets
+
+
+# Autocomprobación de la normalización (rutas absolutas y relativas a settings, objetos, señuelos).
+rel_ext = os.path.relpath(ext, base)
+rel_stable = os.path.relpath(stable, base)
+assert rel_ext != str(Path(ext)) and not Path(rel_ext).is_absolute(), "fixture relativa inválida"
+for good in (ext, stable, rel_ext, rel_stable, {"source": ext}, {"source": rel_ext}):
+    assert is_ext(good), "la normalización no reconoce %r" % (good,)
+for bad in ("npm:otro-paquete", "git:github.com/x/y", "https://example.com/x.git", str(base / "otro"),
+            os.path.join(os.path.dirname(rel_ext), "otro"), {"source": "npm:pi-selection-editor"}, 42):
+    assert not is_ext(bad), "la normalización reconoce por error %r" % (bad,)
+
 with open(settings, encoding="utf-8") as f:
     data = json.load(f)
 assert data.get("integrationSentinel") == "keep", "se perdió el ajuste previo del usuario"
 packages = data.get("packages")
 assert isinstance(packages, list), "settings.json no tiene una lista 'packages'"
-hits = [p for p in packages if ext in json.dumps(p) or stable in json.dumps(p)]
+hits = [p for p in packages if is_ext(p)]
 assert len(hits) == 1, "la extensión debe estar registrada exactamente una vez: %r" % (packages,)
 print(json.dumps(packages, sort_keys=True))
 PY
