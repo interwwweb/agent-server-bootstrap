@@ -520,8 +520,21 @@ mod_agents() {
   download_run Herdr herdr https://herdr.dev/install.sh sh
 }
 
+# Wrangler (CLI de Cloudflare Workers; no cloudflared). Cloudflare recomienda instalarlo local por
+# proyecto: esto deja solo una base para la máquina, en un workspace propio y con wrapper.
+mod_wrangler() {
+  local ws=$TOOLS/wrangler
+  require_node wrangler
+  if have wrangler; then
+    log "  wrangler: 'wrangler' ya existe, se omite"
+    return 0
+  fi
+  if [ ! -x "$ws/node_modules/.bin/wrangler" ] || [ "$APPLY" != 1 ]; then npm_workspace "$ws" wrangler; fi
+  write_wrapper wrangler "$ws/node_modules/.bin/wrangler"
+}
+
 mod_cloud() {
-  log "== cloud: vercel, sanity, supabase =="
+  log "== cloud: vercel, sanity, supabase, wrangler =="
   require_node cloud
   npm_global vercel vercel
   npm_global sanity @sanity/cli
@@ -532,6 +545,7 @@ mod_cloud() {
     if [ ! -x "$ws/node_modules/.bin/supabase" ] || [ "$APPLY" != 1 ]; then npm_workspace "$ws" supabase; fi
     write_wrapper supabase "$ws/node_modules/.bin/supabase"
   fi
+  mod_wrangler
 }
 
 mod_remote() {
@@ -618,6 +632,7 @@ summary() {
   local logins="gh auth login, vercel login, supabase login, sanity login, codex login, claude"
   log
   if [ "$APPLY" != 1 ]; then log "Dry-run terminado. Para aplicar: ./install.sh --apply --yes [--vendor-installers]"; return 0; fi
+  if selected cloud; then logins="$logins, wrangler login"; fi
   if [ "$WITH_PI" = 1 ]; then logins="$logins, pi → /login"; fi
   log "Listo. Abre una sesión nueva (o ejecuta: . ~/.profile) y comprueba con ./doctor.sh"
   if [ "$WITH_PI" = 1 ]; then

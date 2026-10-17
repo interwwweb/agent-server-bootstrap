@@ -28,6 +28,9 @@ credentials*
 .vercel/
 .supabase/
 .sanity/
+.wrangler/
+.config/.wrangler/
+.config/wrangler/
 .codex/
 .claude/
 .claude.json

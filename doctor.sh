@@ -118,7 +118,7 @@ if selected node; then
 fi
 selected python && check uv
 if selected agents; then check codex; check claude; check herdr; if [ "$WITH_PI" = 1 ]; then check pi; if have pi; then check_pi_version; fi; check_pi_extension; fi; fi
-selected cloud && for c in vercel sanity supabase; do check "$c"; done
+selected cloud && for c in vercel sanity supabase wrangler; do check "$c"; done
 selected remote && { check moshi-hook; check mosh; }
 # Solo existencia: no se consulta estado, IP, red ni autenticación de Tailscale. tailscaled vive en /usr/sbin.
 selected tailscale && { check tailscale; check tailscaled /usr/sbin/tailscaled; }
@@ -135,7 +135,7 @@ if [ "$VERSIONS" = 1 ]; then
     ( . /etc/os-release; echo "so: ${PRETTY_NAME:-desconocido}" )
   fi
   echo "arquitectura: $(uname -m)"
-  for c in git node npm pnpm python3 uv jq rg tmux mosh gh codex claude herdr pi vercel sanity supabase playwright docker tailscale; do
+  for c in git node npm pnpm python3 uv jq rg tmux mosh gh codex claude herdr pi vercel sanity supabase wrangler playwright docker tailscale; do
     if have "$c"; then
       rc=0
       vflag=--version

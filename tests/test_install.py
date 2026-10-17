@@ -205,6 +205,14 @@ class DryRunTests(Base):
             env=self.env(), capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
 
+    def test_cloud_dry_run_plans_wrangler_workspace_and_wrapper_without_running(self):
+        r = self.run_install("--modules", "cloud,node")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertRegex(r.stdout, r"npm install --prefix \S+/tools/wrangler wrangler")
+        self.assertRegex(r.stdout, r"wrapper \S+/\.local/bin/wrangler -> \S+/tools/wrangler/node_modules/\.bin/wrangler")
+        self.assertNotIn("wrangler login", r.stdout)
+        self.assert_untouched()
+
     def test_node_module_plans_pnpm_without_running_npm(self):
         r = self.run_install("--modules", "node")
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -296,7 +304,7 @@ d=
 while [ $# -gt 0 ]; do if [ "$1" = --prefix ]; then d=$2; fi; shift; done
 if [ -n "$d" ]; then
   mkdir -p "$d/node_modules/.bin"
-  for b in playwright playwright-cli supabase; do
+  for b in playwright playwright-cli supabase wrangler; do
     printf '#!/bin/sh\\necho "BIN %s $*" >> "$MOCK_LOG"\\n' "$b" > "$d/node_modules/.bin/$b"
     chmod 755 "$d/node_modules/.bin/$b"
   done
@@ -835,6 +843,58 @@ if [ "$1" = prefix ]; then echo "$HOME/.local"; fi
         text = (self.home / ".local/bin/supabase").read_text()
         self.assertIn(str(self.home / ".local/share/agent-server-bootstrap/tools/supabase/node_modules/.bin/supabase"), text)
 
+    # --- Wrangler (CLI de Cloudflare Workers) ------------------------------------------------
+
+    def wrangler_ws_bin(self):
+        return self.home / ".local/share/agent-server-bootstrap/tools/wrangler/node_modules/.bin/wrangler"
+
+    def test_mod_wrangler_installs_in_dedicated_workspace_with_wrapper(self):
+        self.fake_npm()
+        self.fake_node(24)
+        r = self.sh(f'{hide("wrangler")}; SELECTED="cloud"; mod_wrangler')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        installs = [c for c in self.calls() if c.startswith("npm install")]
+        self.assertEqual(len(installs), 1)
+        self.assertIn("--prefix", installs[0])
+        self.assertIn("agent-server-bootstrap/tools/wrangler", installs[0])
+        self.assertTrue(installs[0].endswith(" wrangler"))
+        self.assertNotIn(" -g ", installs[0])
+        self.assertFalse(any(c.startswith("sudo") for c in self.calls()))
+        wrapper = self.home / ".local/bin/wrangler"
+        self.assertTrue(os.access(wrapper, os.X_OK))
+        self.assertIn(f"exec {self.wrangler_ws_bin()}", wrapper.read_text())
+        self.assertFalse((self.tmp / "package.json").exists())  # nada en el directorio desde el que se invoca
+
+    def test_mod_wrangler_skips_when_command_already_exists(self):
+        self.fake_npm()
+        self.fake_node(24)
+        self.fake("wrangler", "")
+        r = self.sh('SELECTED="cloud"; mod_wrangler')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("se omite", r.stdout)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse((self.home / ".local").exists())
+
+    def test_mod_wrangler_reuses_workspace_executable_and_keeps_wrapper(self):
+        self.fake_npm()
+        self.fake_node(24)
+        self.assertEqual(self.sh(f'{hide("wrangler")}; mod_wrangler').returncode, 0)
+        wrapper = self.home / ".local/bin/wrangler"
+        wrapper.write_text("#!/bin/sh\n# mío\n")
+        self.log.unlink()
+        r = self.sh(f'{hide("wrangler")}; mod_wrangler')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([c for c in self.calls() if c.startswith("npm install")], [])
+        self.assertEqual(wrapper.read_text(), "#!/bin/sh\n# mío\n")
+
+    def test_mod_wrangler_requires_node_24(self):
+        self.fake_npm()
+        self.fake_node(22)
+        r = self.sh(f'{hide("wrangler")}; mod_wrangler')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(">=24", r.stderr)
+        self.assertEqual(self.calls(), [])
+
     def test_mod_docker_alone_updates_apt_before_install(self):
         self.fake_logger("sudo")
         self.assertEqual(self.sh('SELECTED="docker"; mod_docker').returncode, 0)
@@ -984,6 +1044,22 @@ class DoctorTests(Base):
     def test_without_with_pi_no_extension_checks(self):
         r = self.run_doctor("--modules", "agents")
         self.assertNotIn("pi-selection-editor", r.stdout)
+
+    def test_wrangler_missing_is_reported_in_cloud_module(self):
+        r = self.run_doctor("--modules", "cloud")
+        self.assertRegex(r.stdout, r"(?m)^FALTA\s+wrangler$")
+
+    def test_wrangler_version_reported_without_login(self):
+        d = self.tmp / "wbin"
+        d.mkdir()
+        w = d / "wrangler"
+        w.write_text('#!/bin/sh\necho "wrangler-fake $*" >> "$MOCK_LOG"\necho "4.0.0"\n')
+        w.chmod(0o755)
+        r = self.run_doctor("--modules", "cloud", "--versions", path=f"{d}:{self.mock}:/usr/bin:/bin")
+        self.assertRegex(r.stdout, r"ok\s+wrangler \(")
+        self.assertRegex(r.stdout, r"(?m)^wrangler\s+4\.0\.0$")
+        calls = [c for c in self.log.read_text().splitlines() if c.startswith("wrangler-fake")]
+        self.assertEqual(calls, ["wrangler-fake --version"])
 
     def test_tailscale_missing_is_reported(self):
         r = self.run_doctor("--modules", "tailscale")
