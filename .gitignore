@@ -31,6 +31,10 @@ credentials*
 .wrangler/
 .config/.wrangler/
 .config/wrangler/
+.linear.toml
+.linear/
+.config/linear/
+.config/linear-cli/
 .codex/
 .claude/
 .claude.json

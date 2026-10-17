@@ -16,6 +16,9 @@ PI_VERSION=0.87.1
 PI_EXT_URL="https://github.com/interwwweb/pi-selection-editor.git"
 PI_EXT_TAG=v0.1.2
 PI_EXT_COMMIT=93d60682e2aeca492d05c19ca3dbc3b46f360241
+# Linear CLI COMUNITARIA (schpet/linear-cli, no es oficial de Linear), fijada en una versión exacta.
+LINEAR_PKG="@schpet/linear-cli"
+LINEAR_VERSION=3.0.0
 # Tailscale: repositorio apt oficial firmado. Rutas y URL son constantes; solo los tests que cargan
 # las funciones con `source` las sobrescriben (main no lee overrides del entorno).
 TS_BASE="https://pkgs.tailscale.com/stable/ubuntu"
@@ -533,8 +536,23 @@ mod_wrangler() {
   write_wrapper wrangler "$ws/node_modules/.bin/wrangler"
 }
 
+# Linear CLI comunitaria fijada (excepción a «latest»). Su postinstall descarga un binario nativo (GitHub).
+# No hace auth, whoami ni consulta cuentas, equipos o proyectos; no usa sudo ni npm -g.
+mod_linear() {
+  local ws=$TOOLS/linear
+  require_node linear
+  if have linear; then
+    log "  linear: 'linear' ya existe, se omite (no se valida su versión ni su procedencia)"
+    return 0
+  fi
+  if [ ! -x "$ws/node_modules/.bin/linear" ] || [ "$APPLY" != 1 ]; then
+    npm_workspace "$ws" --save-exact "$LINEAR_PKG@$LINEAR_VERSION"
+  fi
+  write_wrapper linear "$ws/node_modules/.bin/linear"
+}
+
 mod_cloud() {
-  log "== cloud: vercel, sanity, supabase, wrangler =="
+  log "== cloud: vercel, sanity, supabase, wrangler, linear =="
   require_node cloud
   npm_global vercel vercel
   npm_global sanity @sanity/cli
@@ -546,6 +564,7 @@ mod_cloud() {
     write_wrapper supabase "$ws/node_modules/.bin/supabase"
   fi
   mod_wrangler
+  mod_linear
 }
 
 mod_remote() {
@@ -632,7 +651,7 @@ summary() {
   local logins="gh auth login, vercel login, supabase login, sanity login, codex login, claude"
   log
   if [ "$APPLY" != 1 ]; then log "Dry-run terminado. Para aplicar: ./install.sh --apply --yes [--vendor-installers]"; return 0; fi
-  if selected cloud; then logins="$logins, wrangler login"; fi
+  if selected cloud; then logins="$logins, wrangler login, linear auth login (solo con almacén seguro; ver docs/secretos.md)"; fi
   if [ "$WITH_PI" = 1 ]; then logins="$logins, pi → /login"; fi
   log "Listo. Abre una sesión nueva (o ejecuta: . ~/.profile) y comprueba con ./doctor.sh"
   if [ "$WITH_PI" = 1 ]; then

@@ -57,7 +57,7 @@ Los argumentos desconocidos se rechazan antes de cualquier cambio. `--help` func
 | `node` | sí | Node v24 (última de la rama) desde el tarball oficial de nodejs.org, verificado con SHASUMS256, en `~/.local/share/agent-server-bootstrap/node`. Incluye npm y, tras Node, instala `pnpm` con `npm install -g` en el prefijo de usuario (se omite si ya existe). Archivo de entorno + bloque guardado en `~/.profile`. Si ya hay Node ≥ 24 **con npm**, no se descarga; si `current` ya apunta a otro Node, se aborta sin tocar nada. |
 | `python` | sí | `uv` con su instalador (script de terceros, requiere `--vendor-installers`; sin que modifique el PATH). |
 | `agents` | sí | Codex (`@openai/codex`, npm de usuario), Claude Code (instalador oficial, canal `stable`), Herdr (script de terceros). Pi solo con `--with-pi`. |
-| `cloud` | sí | `vercel` y `@sanity/cli` (npm de usuario); `supabase` y `wrangler` (CLI de Cloudflare Workers, no `cloudflared`) cada uno en un workspace propio con wrapper (no se admite `npm -g` para estos). |
+| `cloud` | sí | `vercel` y `@sanity/cli` (npm de usuario); `supabase`, `wrangler` (CLI de Cloudflare Workers, no `cloudflared`) y `linear` (CLI **comunitaria** `@schpet/linear-cli@3.0.0`, fijada) cada uno en un workspace propio con wrapper (no se admite `npm -g` para estos). |
 | `remote` | sí | moshi-hook (script de terceros). `mosh` llega con `base`. |
 | `tailscale` | sí | Paquete `tailscale` del repositorio apt oficial firmado `https://pkgs.tailscale.com/stable/ubuntu` (jammy en 22.04, noble en 24.04), sin script de terceros: no exige `--vendor-installers`. Ver «Tailscale» abajo. |
 | `playwright` | sí | `@playwright/test` y `@playwright/cli` en un workspace dedicado, wrappers `playwright` y `playwright-cli`, y Chromium. No escribe nada en el proyecto desde el que se invoca. |
@@ -69,6 +69,7 @@ Detalles de diseño:
 - **Dependencias antes de cambiar nada**: con `--apply`, `agents`, `cloud` y `playwright` exigen Node ≥ 24 y npm; si no incluyes `node` y no están, el script aborta antes de instalar nada.
 - **Node/npm**: prefijo de npm en `~/.local` (`NPM_CONFIG_PREFIX`); nunca `sudo npm`. Se aborta si el prefijo global no está dentro de `$HOME`.
 - **Qué no sobrescribe** (alcance concreto, no una garantía general): los wrappers de `~/.local/bin`, el archivo de entorno, los enlaces (`fd`, `current` de Node) y los archivos de apt de Tailscale solo se crean si no existen, y `~/.profile` recibe un bloque que se añade una sola vez. Un comando ya presente en el PATH se omite en los pasos `npm_global` y `download_run`. **No** es una garantía sobre lo que hacen los gestores de paquetes (apt, npm, Playwright) ni los instaladores de terceros (uv, Claude Code, Herdr, moshi-hook), que siguen su propia política y pueden actualizar dependencias o modificar archivos. Detalle en «Qué pasa si ya hay herramientas».
+- **Linear CLI** (`cloud`): es la CLI **comunitaria** [schpet/linear-cli](https://github.com/schpet/linear-cli), **no es oficial de Linear**. Se instala `@schpet/linear-cli@3.0.0` con `--save-exact` en `~/.local/share/agent-server-bootstrap/tools/linear` (excepción a «latest», como Pi): el paquete expone el binario `linear` mediante `run-linear.js` y su **postinstall descarga un binario nativo** (de GitHub); no hace falta Deno. Si ya existe `linear` en el PATH se omite sin validar su versión ni procedencia; el ejecutable del workspace se reutiliza y el wrapper `~/.local/bin/linear` no se sobrescribe. No usa sudo ni `npm -g`, y **nunca** ejecuta `linear auth`, `whoami` ni consultas de cuenta, equipo, proyecto o tareas. La autenticación es manual (`linear auth login`, que solo se imprime) y conviene hacerla **solo con un almacén seguro disponible**: un llavero de Linux exige Secret Service desbloqueado y D-Bus (en un servidor sin escritorio `libsecret-tools` no basta). Mira [docs/secretos.md](docs/secretos.md) (guía orientativa; no activa ningún almacén de secretos). `.gitignore` cubre `.linear.toml`, `.linear/`, `.config/linear/` y `.config/linear-cli/`, pero ignorar archivos **no basta** si ya están seguidos por Git.
 - **Wrangler** (`cloud`): si ya existe `wrangler` en el PATH, se omite. Si no, se instala en `~/.local/share/agent-server-bootstrap/tools/wrangler` (reutilizando el ejecutable si ya está) y el wrapper `~/.local/bin/wrangler` no se sobrescribe. Los scripts de npm se ejecutan con normalidad (Wrangler necesita `workerd`). Cloudflare recomienda instalarlo **local por proyecto** (`npm i -D wrangler@latest`): este wrapper es solo una base para la máquina y cada proyecto debería fijar su Wrangler local para ser reproducible. No se toca ningún proyecto, ni se hace login, ni se consulta cuenta, ni se despliega nada ni se tocan DNS o túneles.
 - **Supabase**: se instala en `~/.local/share/agent-server-bootstrap/tools/supabase` y el wrapper `~/.local/bin/supabase` ejecuta el binario por ruta absoluta (no se descarga «latest» en cada invocación).
 - **Playwright**: `install --with-deps chromium` se ejecuta en dos pasos equivalentes: `sudo … install-deps chromium` (apt) y `install chromium` como usuario, para que el navegador quede en tu HOME y no en el de root. Solo ocurre con `--apply`.
@@ -110,6 +111,7 @@ vercel login
 supabase login
 sanity login
 wrangler login    # opcional: Cloudflare; no se ejecuta aquí
+linear auth login # opcional: Linear (comunitaria); solo con almacén seguro, sin pasar claves por línea de comandos
 codex login
 claude          # sigue el flujo de inicio de sesión
 pi              # solo con --with-pi: escribe /login
@@ -137,6 +139,8 @@ Probado (en local, con comandos simulados; ver `tests/`):
 - Bloque de `~/.profile` idempotente; no sobrescribir el archivo de entorno ni binarios/wrappers existentes.
 - Tailscale con `curl`, `sudo` y `apt-get` simulados y rutas temporales: módulo por defecto, solo-tailscale en dry-run sin escrituras ni red ni `--vendor-installers`, codename jammy/noble, omisión del par existente antes de red o sudo, instalación parcial rechazada, orden clave → lista → apt, conflictos y symlinks sin escribir nada, estado previo (archivo, directorio o symlink roto) que impide red, sudo y apt y se conserva intacto, omisión del par completo aunque haya estado, descarga vacía y comprobaciones previas. Nunca se invocan `tailscale up/login/status`.
 - Wrangler con `npm` simulado (sin red): instalación en workspace dedicado con wrapper, omisión si ya existe el comando, reutilización del ejecutable sin sobrescribir el wrapper, exigencia de Node ≥ 24, plan de dry-run sin ejecutar, y `doctor` (falta, versión sin login). La instalación real de Wrangler **no** está probada y no tiene job de CI propio.
+- Linear CLI con `npm` simulado (sin red): paquete fijado `@schpet/linear-cli@3.0.0` con `--save-exact` en un workspace dedicado y wrapper, omisión si ya existe el comando, reutilización del ejecutable sin sobrescribir el wrapper, Node ≥ 24, ni Deno ni `-g` ni sudo, plan de dry-run sin ejecutar, `doctor` (falta, versión) y ninguna invocación de la CLI desde `install.sh`.
+- `tests/linear-integration.sh` (opt-in con `ASB_LINEAR_INTEGRATION=1`, en un `HOME` temporal y con Node 24) instala de verdad solo `mod_linear` (usa red: npm y el binario nativo de GitHub) y comprueba versión, `package-lock.json`, segunda pasada sin cambios y que no se crea ninguna credencial; su job de CI nuevo (Ubuntu 22.04 y 24.04, sin tokens) **aún no se ha ejecutado**: no hay prueba de que funcione hasta que pase.
 - Funciones del instalador cargadas con `source` y comandos simulados: rechazo de Node < 24 o sin npm (también sin el módulo `node`), workspaces npm y wrappers idempotentes, `apt-get update` antes de instalar Docker, rechazo de `--apply` sin `--vendor-installers` para `python`/`agents`/`remote`, y fallo temprano si `current` apunta a otro Node.
 - `doctor.sh`: sin expansión de globs, `--modules` vacío rechazado, `--with-pi` exige `agents` (y comprueba versión de Pi, clon y commit de la extensión y enlace estable), y `--versions` informa como fallo un ejecutable cuyo `--version` falla.
 - Pi y extensión (con `git`, `pi`, `npm` y `bash` simulados): orden Pi → clon → instalador upstream, Pi incompatible aborta sin instalar, clon existente verificado se reutiliza, origin/commit/sucio/symlink impiden el instalador, clon fallido sin directorio roto, `PI_CODING_AGENT_DIR` heredado y settings intactos. La instalación real de Pi y su extensión se verifica por separado en el job de integración de CI.
@@ -148,12 +152,12 @@ Probado (en local, con comandos simulados; ver `tests/`):
 
 **Límites**: estas integraciones no prueban el bootstrap completo con todos los módulos, ningún VPS del usuario, arm64, `doctor.sh --smoke`, Chromium, ni el terminal interactivo Ghostty/Herdr. Tampoco verifican una conexión real a una tailnet ni las políticas de red. Los resultados específicos de cada ejecución están en Actions, no se deducen de las pruebas simuladas.
 
-> Verificación local del 17/10/2026 (macOS): sintaxis Bash y ShellCheck correctos; **89 pruebas con comandos simulados aprobadas**. Para repetir:
+> Verificación local del 17/10/2026 (macOS): sintaxis Bash y ShellCheck correctos; **97 pruebas con comandos simulados aprobadas**. Para repetir:
 > `bash -n install.sh doctor.sh tests/pi-integration.sh tests/tailscale-integration.sh && shellcheck install.sh doctor.sh tests/pi-integration.sh tests/tailscale-integration.sh && python3 -I -m unittest discover -s tests -v`.
 
 ## Versiones y reproducibilidad
 
-Las dependencias se instalan en «latest» salvo Pi y su extensión, fijados con `--with-pi` (Pi 0.87.1, pi-selection-editor v0.1.2 en un commit concreto). Node v24 más reciente, paquetes npm sin fijar, instaladores de terceros en su estado actual). **No se garantiza reproducibilidad.** Para dejar constancia de lo que se instaló:
+Las dependencias se instalan en «latest» salvo Pi y su extensión, fijados con `--with-pi` (Pi 0.87.1, pi-selection-editor v0.1.2 en un commit concreto), y la Linear CLI comunitaria (`@schpet/linear-cli@3.0.0`). Node v24 más reciente, paquetes npm sin fijar, instaladores de terceros en su estado actual). **No se garantiza reproducibilidad.** Para dejar constancia de lo que se instaló:
 
 ```bash
 ./doctor.sh --versions > informe-versiones-$(date +%F).txt
@@ -174,6 +178,8 @@ Comprobadas en los sitios oficiales el 17/10/2026 (por quien coordina el proyect
 - Moshi (verificado): <https://getmoshi.app/>
 - Mosh: <https://mosh.org/>
 - Vercel CLI (verificado): <https://vercel.com/docs/cli>
+- Linear CLI comunitaria (verificado en npm y su README): <https://github.com/schpet/linear-cli> · autenticación: <https://github.com/schpet/linear-cli/blob/main/docs/authentication.md>
+- Bitwarden Secrets Manager (solo referencia de [docs/secretos.md](docs/secretos.md); plan y permisos no verificados): <https://bitwarden.com/help/secrets-manager-cli/> · <https://bitwarden.com/help/machine-accounts/>
 - Wrangler (Cloudflare Workers; verificado, recomienda instalación local por proyecto): <https://developers.cloudflare.com/workers/wrangler/install-and-update/>
 - Sanity CLI (verificado): <https://www.sanity.io/docs/apis-and-sdks/cli>
 - Supabase CLI (verificado; guía de CLI): <https://supabase.com/docs/guides/local-development/cli/getting-started>
@@ -188,5 +194,6 @@ install.sh          instalador (dry-run por defecto)
 doctor.sh           comprobación de comandos, versiones y smoke test
 tests/              tests unittest con comandos simulados
 .github/workflows/  CI con permisos de repositorio de solo lectura; lint, mocks e integraciones Pi/Tailscale
+docs/secretos.md    guía orientativa sobre secretos (no instala ni activa nada)
 SECURITY.md         cadena de suministro y permisos de agentes
 ```

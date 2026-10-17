@@ -213,6 +213,14 @@ class DryRunTests(Base):
         self.assertNotIn("wrangler login", r.stdout)
         self.assert_untouched()
 
+    def test_cloud_dry_run_plans_pinned_linear_without_running(self):
+        r = self.run_install("--modules", "cloud,node")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertRegex(r.stdout, r"npm install --prefix \S+/tools/linear --save-exact @schpet/linear-cli@3\.0\.0")
+        self.assertRegex(r.stdout, r"wrapper \S+/\.local/bin/linear -> \S+/tools/linear/node_modules/\.bin/linear")
+        self.assertNotIn("linear auth", r.stdout)
+        self.assert_untouched()
+
     def test_node_module_plans_pnpm_without_running_npm(self):
         r = self.run_install("--modules", "node")
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -304,7 +312,7 @@ d=
 while [ $# -gt 0 ]; do if [ "$1" = --prefix ]; then d=$2; fi; shift; done
 if [ -n "$d" ]; then
   mkdir -p "$d/node_modules/.bin"
-  for b in playwright playwright-cli supabase wrangler; do
+  for b in playwright playwright-cli supabase wrangler linear; do
     printf '#!/bin/sh\\necho "BIN %s $*" >> "$MOCK_LOG"\\n' "$b" > "$d/node_modules/.bin/$b"
     chmod 755 "$d/node_modules/.bin/$b"
   done
@@ -895,6 +903,65 @@ if [ "$1" = prefix ]; then echo "$HOME/.local"; fi
         self.assertIn(">=24", r.stderr)
         self.assertEqual(self.calls(), [])
 
+    # --- Linear CLI comunitaria (schpet/linear-cli) fijada ------------------------------------
+
+    def linear_ws_bin(self):
+        return self.home / ".local/share/agent-server-bootstrap/tools/linear/node_modules/.bin/linear"
+
+    def test_mod_linear_installs_pinned_package_in_dedicated_workspace(self):
+        self.fake_npm()
+        self.fake_node(24)
+        r = self.sh(f'{hide("linear")}; SELECTED="cloud"; mod_linear')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        installs = [c for c in self.calls() if c.startswith("npm install")]
+        self.assertEqual(len(installs), 1)
+        self.assertIn("agent-server-bootstrap/tools/linear", installs[0])
+        self.assertIn("--save-exact", installs[0])
+        self.assertTrue(installs[0].endswith(" @schpet/linear-cli@3.0.0"))
+        self.assertNotIn(" -g ", installs[0])
+        self.assertNotIn("deno", " ".join(self.calls()).lower())
+        self.assertFalse(any(c.startswith("sudo") for c in self.calls()))
+        wrapper = self.home / ".local/bin/linear"
+        self.assertTrue(os.access(wrapper, os.X_OK))
+        self.assertIn(f"exec {self.linear_ws_bin()}", wrapper.read_text())
+
+    def test_mod_linear_skips_when_command_already_exists(self):
+        self.fake_npm()
+        self.fake_node(24)
+        self.fake("linear", "")
+        r = self.sh('SELECTED="cloud"; mod_linear')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("se omite", r.stdout)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse((self.home / ".local").exists())
+
+    def test_mod_linear_reuses_workspace_launcher_and_keeps_wrapper(self):
+        self.fake_npm()
+        self.fake_node(24)
+        self.assertEqual(self.sh(f'{hide("linear")}; mod_linear').returncode, 0)
+        wrapper = self.home / ".local/bin/linear"
+        wrapper.write_text("#!/bin/sh\n# mío\n")
+        self.log.unlink()
+        r = self.sh(f'{hide("linear")}; mod_linear')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([c for c in self.calls() if c.startswith("npm install")], [])
+        self.assertEqual(wrapper.read_text(), "#!/bin/sh\n# mío\n")
+
+    def test_mod_linear_requires_node_24(self):
+        self.fake_npm()
+        self.fake_node(22)
+        r = self.sh(f'{hide("linear")}; mod_linear')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(">=24", r.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_mod_linear_never_calls_the_cli(self):
+        self.fake_npm()
+        self.fake_node(24)
+        # El launcher simulado registra cualquier invocación: install.sh no debe ejecutarlo nunca.
+        self.sh(f'{hide("linear")}; mod_linear')
+        self.assertEqual([c for c in self.calls() if c.startswith("BIN linear")], [])
+
     def test_mod_docker_alone_updates_apt_before_install(self):
         self.fake_logger("sudo")
         self.assertEqual(self.sh('SELECTED="docker"; mod_docker').returncode, 0)
@@ -1060,6 +1127,22 @@ class DoctorTests(Base):
         self.assertRegex(r.stdout, r"(?m)^wrangler\s+4\.0\.0$")
         calls = [c for c in self.log.read_text().splitlines() if c.startswith("wrangler-fake")]
         self.assertEqual(calls, ["wrangler-fake --version"])
+
+    def test_linear_missing_is_reported_in_cloud_module(self):
+        r = self.run_doctor("--modules", "cloud")
+        self.assertRegex(r.stdout, r"(?m)^FALTA\s+linear$")
+
+    def test_linear_version_reported_without_any_auth_call(self):
+        d = self.tmp / "lbin"
+        d.mkdir()
+        p = d / "linear"
+        p.write_text('#!/bin/sh\necho "linear-fake $*" >> "$MOCK_LOG"\necho "3.0.0"\n')
+        p.chmod(0o755)
+        r = self.run_doctor("--modules", "cloud", "--versions", path=f"{d}:{self.mock}:/usr/bin:/bin")
+        self.assertRegex(r.stdout, r"ok\s+linear \(")
+        self.assertRegex(r.stdout, r"(?m)^linear\s+3\.0\.0$")
+        calls = [c for c in self.log.read_text().splitlines() if c.startswith("linear-fake")]
+        self.assertEqual(calls, ["linear-fake --version"])
 
     def test_tailscale_missing_is_reported(self):
         r = self.run_doctor("--modules", "tailscale")
