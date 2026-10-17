@@ -681,7 +681,10 @@ mod_playwright() {
   require_node playwright
   local ws=$TOOLS/playwright pw
   local -a pkgs
-  pw=$ws/node_modules/.bin/playwright
+  # Entrada estable y determinista: el cli.js de @playwright/test (resuelve SU propio playwright, fijado).
+  # NO se usa node_modules/.bin/playwright: @playwright/cli trae un playwright alfa distinto y npm puede
+  # elevarlo a la raíz, de modo que ese .bin sería ambiguo (instalaría un Chromium que la API estable no espera).
+  pw=$ws/node_modules/@playwright/test/cli.js
   case "$OS_CODENAME" in
     jammy) pkgs=("${PW_APT_JAMMY[@]}") ;;
     noble) pkgs=("${PW_APT_NOBLE[@]}") ;;
@@ -689,6 +692,10 @@ mod_playwright() {
   esac
   if [ ! -x "$pw" ] || [ "$APPLY" != 1 ]; then
     npm_workspace "$ws" --save-exact "@playwright/test@$PLAYWRIGHT_TEST_VERSION" "@playwright/cli@$PLAYWRIGHT_CLI_VERSION"
+  fi
+  # Un wrapper `playwright` de una ejecución anterior no se sobrescribe: si no apunta a la entrada estable, se avisa.
+  if [ "$APPLY" = 1 ] && [ -f "$LOCAL_BIN/playwright" ] && ! grep -qF "$pw" "$LOCAL_BIN/playwright"; then
+    warn "$LOCAL_BIN/playwright ya existe y no apunta a $pw (puede ser de una versión anterior, con el .bin ambiguo): no se sobrescribe; revísalo a mano"
   fi
   write_wrapper playwright "$pw"
   write_wrapper playwright-cli "$ws/node_modules/.bin/playwright-cli"

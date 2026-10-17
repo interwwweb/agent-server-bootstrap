@@ -40,6 +40,11 @@ mkdir -p "$HOME" "$PLAYWRIGHT_BROWSERS_PATH"
 . "$REPO/install.sh"
 
 it_cleanup() {
+  local rc=$?
+  if [ "$rc" -ne 0 ] && [ -f "$TMP/second.log" ]; then
+    printf '%s\n' "--- log de la segunda pasada ---" >&2
+    cat "$TMP/second.log" >&2
+  fi
   case "$TMP" in "$BASE"/asb-playwright-integration.*) rm -rf -- "$TMP" ;; esac
 }
 trap it_cleanup EXIT
@@ -50,22 +55,34 @@ APPLY=1 SELECTED="playwright" OS_CODENAME="$codename"
 cd "$HOME"
 
 ws="$TOOLS/playwright"
-pw="$ws/node_modules/.bin/playwright"
+# Entrada estable de @playwright/test. El .bin/playwright de la raíz es ambiguo (puede ser el alfa que trae
+# @playwright/cli tras la elevación de npm): ni se usa ni se exige que sea el estable.
+pw="$ws/node_modules/@playwright/test/cli.js"
 
 node_version_of() { node -p "require('$1').version"; }
+
+# Versión del paquete `playwright` que @playwright/test resuelve realmente (createRequire desde su carpeta).
+resolved_playwright_version() {
+  node -p "const { createRequire } = require('module'); const path = require('path');
+const r = createRequire('$ws/node_modules/@playwright/test/package.json');
+require(path.join(path.dirname(r.resolve('playwright')), 'package.json')).version"
+}
 
 check_versions() {
   [ "$(node_version_of "$ws/node_modules/@playwright/test/package.json")" = "$PLAYWRIGHT_TEST_VERSION" ] \
     || fail "@playwright/test instalado distinto de $PLAYWRIGHT_TEST_VERSION"
   [ "$(node_version_of "$ws/node_modules/@playwright/cli/package.json")" = "$PLAYWRIGHT_CLI_VERSION" ] \
     || fail "@playwright/cli instalado distinto de $PLAYWRIGHT_CLI_VERSION"
-  # El ejecutable raíz y el núcleo deben ser los de @playwright/test (el CLI trae su propio playwright alfa, anidado).
-  [ "$(node_version_of "$ws/node_modules/playwright/package.json")" = "$PLAYWRIGHT_TEST_VERSION" ] \
-    || fail "el paquete playwright de la raíz no es $PLAYWRIGHT_TEST_VERSION"
-  [ "$(node_version_of "$ws/node_modules/playwright-core/package.json")" = "$PLAYWRIGHT_TEST_VERSION" ] \
-    || fail "playwright-core de la raíz no es $PLAYWRIGHT_TEST_VERSION"
-  "$pw" --version | grep -qF "$PLAYWRIGHT_TEST_VERSION" || fail "el ejecutable raíz no informa $PLAYWRIGHT_TEST_VERSION"
+  resolved=$(resolved_playwright_version) || fail "no se pudo resolver el playwright de @playwright/test"
+  [ "$resolved" = "$PLAYWRIGHT_TEST_VERSION" ] \
+    || fail "@playwright/test resuelve playwright $resolved, se esperaba $PLAYWRIGHT_TEST_VERSION"
+  # Solo informativo: el playwright de la raíz puede ser el alfa del CLI (elevación de npm).
+  printf 'info: playwright raíz %s; resuelto por @playwright/test %s\n' \
+    "$(node_version_of "$ws/node_modules/playwright/package.json" 2>/dev/null || printf 'ausente')" "$resolved"
+  "$pw" --version | grep -qF "$PLAYWRIGHT_TEST_VERSION" || fail "la entrada estable no informa $PLAYWRIGHT_TEST_VERSION"
   playwright --version | grep -qF "$PLAYWRIGHT_TEST_VERSION" || fail "el wrapper playwright no informa $PLAYWRIGHT_TEST_VERSION"
+  grep -qF "$pw" "$HOME/.local/bin/playwright" || fail "el wrapper playwright no apunta a la entrada estable"
+  if grep -qF ".bin/playwright" "$HOME/.local/bin/playwright"; then fail "el wrapper playwright usa el .bin ambiguo"; fi
   if ! playwright-cli --version >/dev/null 2>&1; then
     playwright-cli --help >/dev/null 2>&1 || fail "el wrapper playwright-cli no responde a --version ni --help"
   fi
@@ -107,9 +124,11 @@ lock_sum=$(sha256sum "$ws/package-lock.json")
 wrappers_sum=$(sha256sum "$HOME/.local/bin/playwright" "$HOME/.local/bin/playwright-cli")
 
 step "segunda pasada (sin reinstalar npm; apt y navegador pueden repetirse)"
-second=$(mod_playwright)
-printf '%s\n' "$second"
-if printf '%s\n' "$second" | grep -qF "npm install"; then fail "la segunda pasada volvió a ejecutar npm install"; fi
+# Subshell con `set -e` explícito y SIN `if`/`||`: dentro de $(...) o de un `||` Bash ignoraría errexit y
+# un fallo de apt no abortaría mod_playwright. El log se vuelca al salir si algo falla (ver it_cleanup).
+( set -e; mod_playwright ) > "$TMP/second.log" 2>&1
+cat "$TMP/second.log"
+if grep -qF "npm install" "$TMP/second.log"; then fail "la segunda pasada volvió a ejecutar npm install"; fi
 [ "$(sha256sum "$ws/package.json")" = "$pkg_sum" ] || fail "cambió package.json"
 [ "$(sha256sum "$ws/package-lock.json")" = "$lock_sum" ] || fail "cambió package-lock.json"
 [ "$(sha256sum "$HOME/.local/bin/playwright" "$HOME/.local/bin/playwright-cli")" = "$wrappers_sum" ] || fail "cambiaron los wrappers"

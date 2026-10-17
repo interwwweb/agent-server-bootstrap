@@ -316,6 +316,9 @@ d=
 while [ $# -gt 0 ]; do if [ "$1" = --prefix ]; then d=$2; fi; shift; done
 if [ -n "$d" ]; then
   mkdir -p "$d/node_modules/.bin"
+  mkdir -p "$d/node_modules/@playwright/test"
+  printf '#!/bin/sh\\necho "BIN playwright-test-cli $*" >> "$MOCK_LOG"\\n' > "$d/node_modules/@playwright/test/cli.js"
+  chmod 755 "$d/node_modules/@playwright/test/cli.js"
   for b in playwright playwright-cli supabase wrangler linear; do
     printf '#!/bin/sh\\necho "BIN %s $*" >> "$MOCK_LOG"\\n' "$b" > "$d/node_modules/.bin/$b"
     chmod 755 "$d/node_modules/.bin/$b"
@@ -944,15 +947,49 @@ printf '%s' '{content}' > "$out"
         self.assertIn("apt-get update", sudo_calls[0])
         self.assertIn("apt-get install -y --no-install-recommends", sudo_calls[1])
         self.assertIn("libasound2t64", sudo_calls[1])
-        self.assertTrue(any(c.endswith("install chromium") for c in self.calls() if c.startswith("BIN")))
+        # El navegador se instala con la entrada estable de @playwright/test, no con el .bin ambiguo.
+        self.assertIn("BIN playwright-test-cli install chromium", self.calls())
+        self.assertEqual([c for c in self.calls() if c.startswith("BIN playwright install")], [])
+        stable = self.home / ".local/share/agent-server-bootstrap/tools/playwright/node_modules/@playwright/test/cli.js"
         wrappers = [self.home / ".local/bin/playwright", self.home / ".local/bin/playwright-cli"]
         before = [w.read_text() for w in wrappers]
+        self.assertIn(f"exec {stable}", wrappers[0].read_text())
+        self.assertNotIn(".bin/playwright", wrappers[0].read_text())
+        self.assertIn(".bin/playwright-cli", wrappers[1].read_text())
         for w in wrappers:
             self.assertTrue(os.access(w, os.X_OK))
             self.assertIn("exec ", w.read_text())
         self.assertEqual(self.sh(script).returncode, 0)
         self.assertEqual(len([c for c in self.calls() if c.startswith("npm ")]), 1)
         self.assertEqual([w.read_text() for w in wrappers], before)
+
+    def test_mod_playwright_installs_when_only_ambiguous_bin_exists_and_keeps_stale_wrapper(self):
+        self.fake_npm()
+        self.fake_node(24)
+        self.fake_logger("sudo")
+        ws = self.home / ".local/share/agent-server-bootstrap/tools/playwright"
+        (ws / "node_modules/.bin").mkdir(parents=True)
+        old_bin = ws / "node_modules/.bin/playwright"
+        old_bin.write_text("#!/bin/sh\n")
+        old_bin.chmod(0o755)
+        stale = self.home / ".local/bin/playwright"
+        stale.parent.mkdir(parents=True)
+        stale.write_text(f"#!/usr/bin/env bash\nexec {old_bin} \"$@\"\n")
+        r = self.sh('SELECTED="playwright"; OS_CODENAME=noble; mod_playwright')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # La entrada estable faltaba: se instalan los pines pedidos (sin borrar el workspace).
+        self.assertEqual(len([c for c in self.calls() if c.startswith("npm install")]), 1)
+        self.assertTrue(old_bin.exists())
+        # El wrapper previo no se sobrescribe, pero se avisa de que no apunta a la entrada estable.
+        self.assertIn(str(old_bin), stale.read_text())
+        self.assertIn("no apunta", r.stderr)
+        self.assertIn("BIN playwright-test-cli install chromium", self.calls())
+
+    def test_install_script_never_uses_ambiguous_root_playwright_bin(self):
+        import re as _re
+        code = "\n".join(l for l in INSTALL.read_text().splitlines() if not l.lstrip().startswith("#"))
+        self.assertEqual(_re.findall(r"\.bin/playwright(?!-cli)", code), [])
+        self.assertIn("@playwright/test/cli.js", code)
 
     def test_mod_cloud_supabase_wrapper_uses_workspace_binary(self):
         self.fake_npm()
