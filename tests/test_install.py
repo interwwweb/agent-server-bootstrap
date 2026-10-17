@@ -1226,6 +1226,38 @@ class SupplyChainTests(Base):
         self.assertNotIn("secrets.", text)
         self.assertNotIn("GITLEAKS_LICENSE", text)
 
+    def test_playwright_integration_refuses_without_explicit_opt_in(self):
+        # Sin ASB_EPHEMERAL_RUNNER=1 el script debe salir antes de crear nada o invocar comandos.
+        # (Nunca se activa el opt-in en estos tests: en Linux instalaría paquetes de verdad.)
+        env = self.env(TMPDIR=str(self.tmp))
+        r = subprocess.run([BASH, str(ROOT / "tests/playwright-integration.sh")], env=env, cwd=self.tmp,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("ASB_EPHEMERAL_RUNNER=1", r.stderr)
+        self.assertEqual(list(self.home.rglob("*")), [])
+        self.assertFalse(any(p.name.startswith("asb-playwright") for p in self.tmp.iterdir()))
+        self.assertFalse(self.log.exists())
+
+    def test_playwright_integration_guards_come_before_any_write_and_ci_runs_it_opt_in(self):
+        script = (ROOT / "tests/playwright-integration.sh").read_text()
+        order = [script.index(m) for m in ('"${ASB_EPHEMERAL_RUNNER:-}" = 1', "uname -s", "id -u", "mktemp -d")]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("PLAYWRIGHT_BROWSERS_PATH", script)
+        self.assertIn("PLAYWRIGHT_TEST_VERSION", script)
+        self.assertIn("title !== 'hello'", script)
+        for direct in ("sudo apt", "sudo env", "sudo -", "sudo npm", "sudo install", "run sudo"):
+            self.assertNotIn(direct, script)  # el único sudo es el de mod_playwright (install.sh)
+        ci = (ROOT / ".github/workflows/ci.yml").read_text()
+        job = ci[ci.index("  playwright-integration:"):]
+        self.assertIn("timeout-minutes: 15", job)
+        self.assertIn('ASB_EPHEMERAL_RUNNER: "1"', job)
+        self.assertIn("bash tests/playwright-integration.sh", job)
+        self.assertIn("ubuntu-24.04, ubuntu-22.04", job)
+        self.assertIn(self.CHECKOUT, job)
+        self.assertIn(self.SETUP_NODE, job)
+        self.assertIn("bash -n tests/playwright-integration.sh", ci)
+        self.assertIn("tests/playwright-integration.sh\n", ci.split("- name: ShellCheck")[1])
+
     def test_playwright_apt_lists_match_pinned_release(self):
         text = INSTALL.read_text()
         self.assertIn("tag v1.64.1", text)

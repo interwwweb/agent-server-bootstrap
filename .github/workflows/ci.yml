@@ -26,8 +26,9 @@ jobs:
           bash -n tests/pi-integration.sh
           bash -n tests/tailscale-integration.sh
           bash -n tests/linear-integration.sh
+          bash -n tests/playwright-integration.sh
       - name: ShellCheck
-        run: shellcheck install.sh doctor.sh tests/pi-integration.sh tests/tailscale-integration.sh tests/linear-integration.sh
+        run: shellcheck install.sh doctor.sh tests/pi-integration.sh tests/tailscale-integration.sh tests/linear-integration.sh tests/playwright-integration.sh
       - name: Tests (comandos simulados, sin instalar nada)
         run: python3 -I -m unittest discover -s tests -v
 
@@ -111,3 +112,23 @@ jobs:
         env:
           ASB_LINEAR_INTEGRATION: "1"
         run: bash tests/linear-integration.sh
+
+  playwright-integration:
+    name: integración real de Playwright (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - name: Playwright fijado, apt estático y Chromium en un runner efímero (usa red; sin sitios externos)
+        env:
+          ASB_EPHEMERAL_RUNNER: "1"
+        run: bash tests/playwright-integration.sh
